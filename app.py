@@ -6,14 +6,19 @@ Run:  python app.py      then open  http://localhost:8080
 Uses only the Python standard library (no installs needed).
 """
 
+import ast
+import copy
 import csv
 import html
 import json
 import math
 import os
+import secrets
+import threading
+import time
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 
 # ---------------------------------------------------------------------------
 # Site owner (Report 2.3) - edit student_info.py, not this file
@@ -23,6 +28,10 @@ try:
 except ImportError:
     STUDENT_NAME = "YOUR NAME HERE"
     STUDENT_ID = "YOUR DE ANZA STUDENT ID HERE"
+try:  # optional, shown on the Contact page only if filled in
+    from student_info import CONTACT_EMAIL
+except ImportError:
+    CONTACT_EMAIL = ""
 
 LINKEDIN_URL = "https://www.linkedin.com/in/maryam-mahmoudi-ab5422304"
 PHOTO_NAMES = ["photo.jpg", "photo.jpeg", "photo.png", "photo.webp"]
@@ -52,6 +61,7 @@ def clean(value):
 # Domain classes
 # ---------------------------------------------------------------------------
 class Airline:
+    """One airline from SB-airlines.txt (users identify it by its IATA code)."""
     FIELDS = ["OpenFlights ID", "Name", "Alias", "IATA", "ICAO",
               "Callsign", "Country", "Active"]
 
@@ -65,6 +75,7 @@ class Airline:
 
 
 class Airport:
+    """One airport from SB-airports.txt, with GPS position and air-distance calculation."""
     FIELDS = ["OpenFlights ID", "Name", "City", "Country", "IATA", "ICAO",
               "Latitude", "Longitude", "Altitude (ft)", "UTC Offset",
               "DST", "Timezone", "Type", "Source"]
@@ -94,6 +105,7 @@ class Airport:
 
 
 class Route:
+    """One directional route: an airline flying from a source airport to a destination airport."""
     def __init__(self, row):
         (self.airline_code, self.airline_id, self.source_code,
          self.source_id, self.dest_code, self.dest_id, self.codeshare,
@@ -122,6 +134,7 @@ class AviationDatabase:
 
         for row in self._read(data_dir, "SB-routes.txt"):
             self.routes.append(Route(row))
+        self.edits = []  # human-readable log of session-only changes
 
     @staticmethod
     def _read(data_dir, name):
@@ -236,6 +249,96 @@ class AviationDatabase:
                 if r.source_id == source.id and r.dest_id == dest.id
                 and r.stops == 0 and r.airline_id in self.airlines_by_id]
 
+    # ---- Session-only editing (applied to a per-browser copy of the database) ----
+    AIRLINE_EDITABLE = ["name", "alias", "icao", "callsign", "country", "active"]
+    AIRPORT_EDITABLE = ["name", "city", "country", "icao", "latitude", "longitude", "altitude",
+                        "utc_offset", "dst", "timezone", "type", "source"]
+
+    def update_airline(self, iata, form):
+        a = self.get_airline(iata)
+        if not a:
+            raise ValueError(f"No airline with IATA code '{iata}'.")
+        changed = [f for f in self.AIRLINE_EDITABLE if f in form and form[f].strip() != getattr(a, f)]
+        for f in changed:
+            setattr(a, f, form[f].strip())
+        if changed:
+            self.edits.append(f"Edited airline {a.iata}: {', '.join(changed)}")
+        return changed
+
+    def update_airport(self, iata, form):
+        a = self.get_airport(iata)
+        if not a:
+            raise ValueError(f"No airport with IATA code '{iata}'.")
+        try:
+            lat = float(form.get("latitude", a.latitude))
+            lng = float(form.get("longitude", a.longitude))
+        except ValueError:
+            raise ValueError("Latitude and longitude must be numbers.")
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            raise ValueError("Latitude must be -90..90 and longitude -180..180.")
+        changed = [f for f in self.AIRPORT_EDITABLE if f in form and form[f].strip() != getattr(a, f)]
+        for f in changed:
+            setattr(a, f, form[f].strip())
+        a.lat, a.lng = lat, lng
+        if changed:
+            self.edits.append(f"Edited airport {a.iata}: {', '.join(changed)}")
+        return changed
+
+    def add_route(self, airline_iata, src_iata, dst_iata, stops="0", equipment=""):
+        al, s, d = self.get_airline(airline_iata), self.get_airport(src_iata), self.get_airport(dst_iata)
+        if not al:
+            raise ValueError(f"No airline with IATA code '{airline_iata}'.")
+        if not s or not d:
+            raise ValueError(f"Unknown airport '{src_iata if not s else dst_iata}'.")
+        if s is d:
+            raise ValueError("Source and destination must be different airports.")
+        if not str(stops).strip().isdigit():
+            raise ValueError("Stops must be a whole number (0 for non-stop).")
+        self.routes.append(Route([al.iata, al.id, s.iata, s.id, d.iata, d.id, "", str(stops).strip(),
+                                  equipment.strip()]))
+        self.edits.append(f"Added route {al.iata} {s.iata} → {d.iata}")
+
+    def delete_routes(self, airline_iata, src_iata, dst_iata):
+        al, s, d = self.get_airline(airline_iata), self.get_airport(src_iata), self.get_airport(dst_iata)
+        if not (al and s and d):
+            raise ValueError("Please enter a valid airline and two valid airport codes.")
+        before = len(self.routes)
+        self.routes = [r for r in self.routes
+                       if not (r.airline_id == al.id and r.source_id == s.id and r.dest_id == d.id)]
+        removed = before - len(self.routes)
+        if not removed:
+            raise ValueError(f"No {al.iata} route from {s.iata} to {d.iata} exists.")
+        self.edits.append(f"Deleted route {al.iata} {s.iata} → {d.iata}")
+        return removed
+
+    # ---- Statistics for the Charts page ----
+    def stats(self):
+        dist = {}
+        for r in self.routes:
+            s, d = self.airports_by_id.get(r.source_id), self.airports_by_id.get(r.dest_id)
+            if s and d:
+                dist[(r.source_id, r.dest_id)] = (s, d, s.miles_to(d))
+        miles = [v[2] for v in dist.values()]
+        longest = max(dist.values(), key=lambda v: v[2]) if dist else None
+        per_airline = Counter(r.airline_id for r in self.routes)
+        per_airport = Counter()
+        for r in self.routes:
+            per_airport[r.source_id] += 1
+            per_airport[r.dest_id] += 1
+        buckets = [("0-500", 0, 500), ("500-1,000", 500, 1000), ("1,000-2,000", 1000, 2000),
+                   ("2,000-3,000", 2000, 3000), ("3,000-5,000", 3000, 5000), ("5,000+", 5000, 1e9)]
+        return {
+            "routes_per_airline": sorted(((self.airlines_by_id[k], n) for k, n in per_airline.items()
+                                          if k in self.airlines_by_id), key=lambda x: -x[1]),
+            "busiest_airports": [(self.airports_by_id[k], n) for k, n in per_airport.most_common(15)
+                                 if k in self.airports_by_id],
+            "countries": Counter(a.country for a in self.airports_by_iata.values()).most_common(10),
+            "length_buckets": [(lbl, sum(1 for m in miles if lo <= m < hi)) for lbl, lo, hi in buckets],
+            "longest": longest,
+            "avg_miles": sum(miles) / len(miles) if miles else 0,
+            "n_countries": len({a.country for a in self.airports_by_iata.values()}),
+        }
+
     # 2.2a / 2.2b
     def all_airlines(self):
         return sorted(self.airlines_by_iata.values(), key=lambda a: a.iata)
@@ -250,10 +353,79 @@ class _Leg:
         self.source_id, self.dest_id, self.airline_id, self.stops = a.id, b.id, airline.id, 0
 
 
+class SessionStore:
+    """
+    Per-browser copies of the database for session-only edits.
+    A visitor gets a private copy only when they first edit something; the cookie has
+    no expiry, so it disappears when the browser is closed. Other visitors never see it.
+    """
+    MAX_SESSIONS = 30
+    IDLE_SECONDS = 2 * 60 * 60
+
+    def __init__(self, base_db):
+        self.base = base_db
+        self.sessions = {}  # sid -> [db, last_used]
+        self.lock = threading.Lock()
+
+    def _expire(self):
+        now = time.time()
+        for sid in [s for s, (_, t) in self.sessions.items() if now - t > self.IDLE_SECONDS]:
+            del self.sessions[sid]
+        while len(self.sessions) >= self.MAX_SESSIONS:
+            oldest = min(self.sessions, key=lambda s: self.sessions[s][1])
+            del self.sessions[oldest]
+
+    def get(self, sid):
+        with self.lock:
+            entry = self.sessions.get(sid) if sid else None
+            if entry:
+                entry[1] = time.time()
+                return entry[0]
+            return None
+
+    def create(self):
+        with self.lock:
+            self._expire()
+            sid = secrets.token_urlsafe(16)
+            db = copy.deepcopy(self.base)
+            db.edits = []
+            self.sessions[sid] = [db, time.time()]
+            return sid, db
+
+    def reset(self, sid):
+        with self.lock:
+            self.sessions.pop(sid, None)
+
+
+class EditActions:
+    """Applies one posted edit form to a session database. Returns (message, error, extra query)."""
+
+    @staticmethod
+    def run(db, action, form):
+        code = lambda k: form.get(k, "").strip().upper()
+        try:
+            if action == "update_airline":
+                changed = db.update_airline(code("iata"), form)
+                return (f"Airline {code('iata')} saved." if changed else "No changes to save."), "", {"airline": code("iata")}
+            if action == "update_airport":
+                changed = db.update_airport(code("iata"), form)
+                return (f"Airport {code('iata')} saved." if changed else "No changes to save."), "", {"airport": code("iata")}
+            if action == "add_route":
+                db.add_route(code("airline"), code("src"), code("dst"), form.get("stops", "0"), form.get("equipment", ""))
+                return f"Route {code('airline')} {code('src')} → {code('dst')} added.", "", {}
+            if action == "delete_route":
+                n = db.delete_routes(code("airline"), code("src"), code("dst"))
+                return f"Deleted {n} route{'s' if n != 1 else ''} {code('airline')} {code('src')} → {code('dst')}.", "", {}
+            return "", "Unknown action.", {}
+        except ValueError as e:
+            return "", str(e), {}
+
+
 # ---------------------------------------------------------------------------
 # HTML rendering
 # ---------------------------------------------------------------------------
 class Page:
+    """Builds the HTML: page layout, styles, tables, forms, the globe and the search bar."""
     CSS = """
     body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0;background:#f5f7fa;color:#1d2330}
     header{background:#1f3a5f;color:#fff;padding:14px max(24px, calc((100% - 1352px) / 2))}
@@ -307,6 +479,47 @@ class Page:
     .project{margin-top:18px;padding-top:6px;border-top:1px solid #eef1f5;color:#444}
     .project p{margin:8px 0}
     .project a{color:#1f3a5f}
+    nav a.nav2{margin-left:auto}
+    .panel{background:#fff;border:1px solid #dde3ea;border-radius:8px;padding:16px 18px;margin:0 0 16px}
+    .panel h3{margin:0 0 10px}
+    .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:16px;align-items:start}
+    .fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:8px 14px;margin:8px 0 12px}
+    .fields label{display:flex;flex-direction:column;font-size:13px;color:#4f6b8a;gap:3px}
+    .fields input{padding:6px 8px;font-size:14px;border:1px solid #b8c2cf;border-radius:4px;text-transform:none;width:auto}
+    .fields input[readonly]{background:#eef1f5;color:#666}
+    .ok{background:#e6f4ea;border:1px solid #9cd3a8;color:#1e5b2c;padding:8px 12px;border-radius:6px}
+    .err-box{background:#fde8ec;border:1px solid #f3a6b4;color:#8a1c2c;padding:8px 12px;border-radius:6px}
+    .danger{background:#b3261e}
+    .changes li{margin:3px 0}
+    .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin:0 0 16px}
+    .tile{background:#fff;border:1px solid #dde3ea;border-radius:8px;padding:14px 16px}
+    .tile .v{font-size:28px;font-weight:700;color:#1d2330;line-height:1.1}
+    .tile .l{font-size:13px;color:#5b6b7d;margin-top:4px}
+    .chart{background:#fff;border:1px solid #dde3ea;border-radius:8px;padding:16px 18px}
+    .chart h3{margin:0 0 2px;font-size:16px}
+    .chart .sub{margin:0 0 12px;color:#5b6b7d;font-size:13px}
+    .bar-row{display:grid;grid-template-columns:150px 1fr;align-items:center;gap:10px;padding:3px 0;font-size:13px}
+    .bar-row .lbl{color:#1d2330;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .bar-track{position:relative;height:18px}
+    .bar{height:100%;background:#2f6fa3;border-radius:0 4px 4px 0;min-width:2px;position:relative}
+    .bar-row:hover .bar{background:#1f3a5f}
+    .bar-val{position:absolute;top:0;line-height:18px;font-size:12px;color:#1d2330;margin-left:6px;white-space:nowrap}
+    .bar-row .tip{display:none;position:absolute;left:0;top:-30px;background:#1d2330;color:#fff;padding:4px 8px;border-radius:4px;font-size:12px;white-space:nowrap;z-index:2}
+    .bar-row:hover .tip{display:block}
+    .contact-card{background:#fff;border:1px solid #dde3ea;border-radius:10px;padding:24px 28px;max-width:640px;line-height:1.7}
+    .contact-card .row{display:flex;gap:10px;align-items:center;margin:8px 0}
+    .btn-mail{display:inline-block;background:#1f3a5f;color:#fff;text-decoration:none;padding:8px 16px;border-radius:20px;font-weight:600}
+    .class-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;margin:0 0 16px;align-items:start}
+    .cls{background:#fff;border:1px solid #dde3ea;border-radius:8px;padding:12px 14px}
+    .cls h4{margin:0 0 4px;font-family:ui-monospace,Consolas,monospace;color:#1f3a5f}
+    .cls p{margin:0 0 6px;color:#555;font-size:13px}
+    .cls code{font-size:12px;background:#eef1f5;padding:1px 5px;border-radius:3px;display:inline-block;margin:2px 2px 0 0}
+    details.src summary{cursor:pointer;font-weight:600;padding:8px 0}
+    pre.code{margin:0;max-height:75vh;overflow:auto;border:1px solid #dde3ea;border-radius:8px;font-size:13px;line-height:1.45}
+    pre.code code{padding:14px !important}
+    @media(max-width:600px){.grid2{grid-template-columns:1fr}.bar-row{grid-template-columns:96px 1fr}}
+    .banner{background:#fff3c4;border-bottom:1px solid #f0d77a;padding:8px max(24px, calc((100% - 1352px) / 2));font-size:14px}
+    .banner a{color:#1f3a5f;font-weight:600}
     tr.pick{cursor:pointer}
     tr.pick.sel td{background:#fff3c4 !important}
     """
@@ -576,11 +789,17 @@ class Page:
            ("/report/airports", "2.2b All Airports"),
            ("/id", "2.3 Get ID"),
            ("/onehop", "★ One Hop Routes"),
-           ("/about", "About")]
+           ("/charts", "Charts"),
+           ("/edit", "Edit Data"),
+           ("/code", "OO Code"),
+           ("/about", "About"),
+           ("/contact", "Contact")]
+    NAV_SECONDARY = ("/code", "/about", "/contact")
 
     @classmethod
-    def render(cls, title, body, globe_data=None, extra_js=""):
-        nav = "".join(f'<a href="{u}">{html.escape(t)}</a>' for u, t in cls.NAV)
+    def render(cls, title, body, globe_data=None, extra_js="", banner="", extra_head=""):
+        nav = "".join("<a href='%s'%s>%s</a>" % (u, " class='nav2'" if u == cls.NAV_SECONDARY[0] else "",
+                                                  html.escape(t)) for u, t in cls.NAV)
         scripts = f"<script>{extra_js}</script>" if extra_js else ""
         if globe_data is not None:
             data = json.dumps(globe_data).replace("</", "<\\/")
@@ -590,9 +809,9 @@ class Page:
         return (f"<!doctype html><html><head><meta charset='utf-8'>"
                 f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
                 f"<title>{html.escape(title)} - Airline Route Access</title>"
-                f"<style>{cls.CSS}</style></head><body>"
+                f"<style>{cls.CSS}</style>{extra_head}</head><body>"
                 f"<header><a href='/'>✈ Airline Route Access</a></header>"
-                f"<nav>{nav}</nav><main>{body}</main>{scripts}</body></html>")
+                f"<nav>{nav}</nav>{banner}<main>{body}</main>{scripts}</body></html>")
 
     @staticmethod
     def globe(caption, hint=""):
@@ -640,8 +859,12 @@ class Page:
 # Web application (routing)
 # ---------------------------------------------------------------------------
 class AviationWebApp:
-    def __init__(self, db):
+    """Maps each URL to a page and builds that page from the database."""
+    QUERY_HANDLERS = ("/onehop", "/edit")  # these receive the whole query string
+
+    def __init__(self, db, in_session=False):
         self.db = db
+        self.in_session = in_session
         self.routes = {
             "/": self.home,
             "/airline": self.airline_lookup,
@@ -653,13 +876,26 @@ class AviationWebApp:
             "/id": self.get_id,
             "/onehop": self.one_hop,
             "/about": self.about,
+            "/charts": self.charts,
+            "/edit": self.edit_page,
+            "/code": self.code_page,
+            "/contact": self.contact,
         }
+
+    def render(self, title, body, globe_data=None, extra_js="", extra_head=""):
+        """Page.render plus a notice when this browser session has its own edited data."""
+        banner = ""
+        if self.in_session and self.db.edits:
+            n = len(self.db.edits)
+            banner = (f"<div class='banner'>✎ You are viewing data with {n} change{'s' if n != 1 else ''} "
+                      f"made in this browser session only. <a href='/edit'>See or reset changes</a></div>")
+        return Page.render(title, body, globe_data, extra_js, banner, extra_head)
 
     def handle(self, path, query):
         handler = self.routes.get(path)
         if handler is None:
-            return 404, Page.render("Not found", Page.error("Page not found."))
-        if handler == self.one_hop:
+            return 404, self.render("Not found", Page.error("Page not found."))
+        if path in self.QUERY_HANDLERS:
             return 200, handler(query)
         code = query.get("code", [""])[0].strip().upper()
         return 200, handler(code)
@@ -671,14 +907,14 @@ class AviationWebApp:
                 f"<h1>Air Travel Database</h1>"
                 f"<p>{len(self.db.airlines_by_iata)} airlines · {len(self.db.airports_by_iata)} airports · "
                 f"{len(self.db.routes):,} routes</p></div></div>")
-        return Page.render("Home", f"{hero}<div class='cards'>{cards}</div>")
+        return self.render("Home", f"{hero}<div class='cards'>{cards}</div>")
 
     def airline_lookup(self, code):
         body = "<h2>1.1 Airline Lookup</h2>" + Page.form("/airline", "Airline IATA code", code)
         if code:
             a = self.db.get_airline(code)
             body += Page.entity(Airline.FIELDS, a.values()) if a else Page.error(f"No airline with IATA code '{code}'.")
-        return Page.render("Airline Lookup", body)
+        return self.render("Airline Lookup", body)
 
     def airport_lookup(self, code):
         body = "<h2>1.2 Airport Lookup</h2>" + Page.form("/airport", "Airport IATA code", code)
@@ -693,7 +929,7 @@ class AviationWebApp:
                                     f"{len(routes)} routes (all airlines)")
                          + Page.entity(Airport.FIELDS, a.values()))
                 globe = self.db.map_data(routes, focus=a.iata)
-        return Page.render("Airport Lookup", body, globe)
+        return self.render("Airport Lookup", body, globe)
 
     def airline_airports_report(self, code):
         body = ("<h2>2.1a Airports served by an Airline (by # routes)</h2>"
@@ -716,7 +952,7 @@ class AviationWebApp:
                                       [[n] + ap.values() for ap, n in rows],
                                       keys=[ap.iata for ap, _ in rows], kind="airport"))
                 globe = self.db.map_data(routes)
-        return Page.render("Airline → Airports", body, globe)
+        return self.render("Airline → Airports", body, globe)
 
     def airport_airlines_report(self, code):
         body = ("<h2>2.1b Airlines serving an Airport (by # routes)</h2>"
@@ -739,7 +975,7 @@ class AviationWebApp:
                                       [[n] + al.values() for al, n in rows],
                                       keys=[al.iata for al, _ in rows], kind="airline"))
                 globe = self.db.map_data(routes, focus=airport.iata)
-        return Page.render("Airport → Airlines", body, globe)
+        return self.render("Airport → Airlines", body, globe)
 
     def all_airlines_report(self, _):
         rows = self.db.all_airlines()
@@ -750,7 +986,7 @@ class AviationWebApp:
                  "callsign": a.callsign} for a in rows]
         body = (f"<h2>2.2a All Airlines (by IATA code)</h2>{bar}"
                 + Page.table(Airline.FIELDS, [a.values() for a in rows], row_data=data))
-        return Page.render("All Airlines", body, extra_js=Page.FILTER_JS)
+        return self.render("All Airlines", body, extra_js=Page.FILTER_JS)
 
     def all_airports_report(self, _):
         rows = self.db.all_airports()
@@ -763,7 +999,7 @@ class AviationWebApp:
                  "airlines": " ".join(sorted(served.get(a.id, ())))} for a in rows]
         body = (f"<h2>2.2b All Airports (by IATA code)</h2>{bar}"
                 + Page.table(Airport.FIELDS, [a.values() for a in rows], row_data=data))
-        return Page.render("All Airports", body, extra_js=Page.FILTER_JS)
+        return self.render("All Airports", body, extra_js=Page.FILTER_JS)
 
     def one_hop(self, query):
         src = query.get("from", [""])[0].strip().upper()
@@ -786,17 +1022,17 @@ class AviationWebApp:
                 "<button type='submit'>Find routes</button></form>")
         globe = None
         if not (src or dst):
-            return Page.render("One Hop", body)
+            return self.render("One Hop", body)
 
         S, D = self.db.get_airport(src), self.db.get_airport(dst)
         if not src or not dst:
-            return Page.render("One Hop", body + Page.error("Please enter both a From and a To airport code."))
+            return self.render("One Hop", body + Page.error("Please enter both a From and a To airport code."))
         if not S:
-            return Page.render("One Hop", body + Page.error(f"No airport with IATA code '{src}'."))
+            return self.render("One Hop", body + Page.error(f"No airport with IATA code '{src}'."))
         if not D:
-            return Page.render("One Hop", body + Page.error(f"No airport with IATA code '{dst}'."))
+            return self.render("One Hop", body + Page.error(f"No airport with IATA code '{dst}'."))
         if S is D:
-            return Page.render("One Hop", body + Page.error("From and To must be different airports."))
+            return self.render("One Hop", body + Page.error("From and To must be different airports."))
 
         pairs, top5 = self.db.one_hop(S, D, flt)
         direct = self.db.direct_routes(S, D)
@@ -814,7 +1050,7 @@ class AviationWebApp:
                  f"({direct_mi:,.0f} mi straight line)</span></div>")
 
         if not pairs:
-            return Page.render("One Hop", body + Page.error(
+            return self.render("One Hop", body + Page.error(
                 "No one-hop routes found for this airline choice. Try 'Any airlines'."))
 
         # globe: every via airport's two legs; top 5 shown and labelled at start
@@ -851,7 +1087,158 @@ class AviationWebApp:
                               keys=[p["via"].iata for p in pairs], kind="airport",
                               infos=[f"{S.iata} → {p['via'].iata} ({p['airline1'].iata}) → {D.iata} "
                                      f"({p['airline2'].iata}): {p['total']:,.0f} mi" for p in pairs]))
-        return Page.render("One Hop", body, globe)
+        return self.render("One Hop", body, globe)
+
+    # ---------------------------------------------------------------- Charts
+    @staticmethod
+    def bar_chart(title, sub, items, unit=""):
+        """items: [(label, value, tooltip)] - single series, one hue, value label at the bar end."""
+        top = max((v for _, v, _ in items), default=1) or 1
+        rows = ""
+        for label, value, tip in items:
+            pct = 100 * value / top
+            rows += (f"<div class='bar-row'><div class='lbl' title='{html.escape(label)}'>{html.escape(label)}</div>"
+                     f"<div class='bar-track'><div class='tip'>{html.escape(tip)}</div>"
+                     f"<div class='bar' style='width:calc({pct:.2f}% - 60px * {pct / 100:.3f})'></div>"
+                     f"<span class='bar-val' style='left:calc({pct:.2f}% - 60px * {pct / 100:.3f})'>{value:,}{unit}</span>"
+                     f"</div></div>")
+        return f"<div class='chart'><h3>{html.escape(title)}</h3><p class='sub'>{html.escape(sub)}</p>{rows}</div>"
+
+    def charts(self, _):
+        s = self.db.stats()
+        lg = s["longest"]
+        tiles = [(f"{len(self.db.airlines_by_iata)}", "Airlines"),
+                 (f"{len(self.db.airports_by_iata)}", "Airports"),
+                 (f"{len(self.db.routes):,}", "Routes (one direction each)"),
+                 (f"{s['n_countries']}", "Countries served"),
+                 (f"{s['avg_miles']:,.0f} mi", "Average route length"),
+                 (f"{lg[2]:,.0f} mi" if lg else "-", f"Longest: {lg[0].iata} → {lg[1].iata}" if lg else "Longest route")]
+        body = ("<h2>Charts</h2><div class='tiles'>"
+                + "".join(f"<div class='tile'><div class='v'>{html.escape(v)}</div><div class='l'>{html.escape(l)}</div></div>"
+                          for v, l in tiles) + "</div><div class='grid2'>")
+        body += self.bar_chart("Routes per airline", "Number of routes each airline flies",
+                               [(f"{a.iata} {a.name}", n, f"{a.name}: {n:,} routes") for a, n in s["routes_per_airline"]])
+        body += self.bar_chart("Busiest airports", "Top 15 by routes to or from the airport, all airlines",
+                               [(f"{a.iata} {a.city}", n, f"{a.name}: {n:,} routes") for a, n in s["busiest_airports"]])
+        body += self.bar_chart("Airports by country", "Top 10 countries by number of airports",
+                               [(c, n, f"{c}: {n} airports") for c, n in s["countries"]])
+        body += self.bar_chart("Route lengths", "Distinct airport-to-airport connections in each distance band (air miles)",
+                               [(f"{lbl} mi", n, f"{n:,} routes of {lbl} miles") for lbl, n in s["length_buckets"]])
+        body += "</div>"
+        return self.render("Charts", body)
+
+    # ---------------------------------------------------------------- Edit Data
+    def edit_page(self, query):
+        q = lambda k: query.get(k, [""])[0].strip()
+        msg, err = q("msg"), q("err")
+        al_code, ap_code = q("airline").upper(), q("airport").upper()
+        body = ("<h2>Edit Data</h2>"
+                "<p class='hint'>Changes you make here affect <b>only your current browser session</b>. "
+                "Other visitors always see the original data, and your changes disappear when you close "
+                "the browser or click Reset.</p>")
+        if msg:
+            body += f"<p class='ok'>{html.escape(msg)}</p>"
+        if err:
+            body += f"<p class='err-box'>{html.escape(err)}</p>"
+
+        nice = {"icao": "ICAO", "utc_offset": "UTC offset", "dst": "DST", "altitude": "Altitude (ft)"}
+
+        def field(name, label, value, readonly=False):
+            ro = " readonly" if readonly else ""
+            return (f"<label>{html.escape(label)}<input name='{name}' value='{html.escape(value)}'{ro}></label>")
+
+        # airline editor
+        panel = ("<div class='panel'><h3>Edit an airline</h3>"
+                 "<form method='get' action='/edit'><label>Airline IATA code: "
+                 f"<input type='text' name='airline' value='{html.escape(al_code)}'></label> <button>Open</button></form>")
+        if al_code:
+            a = self.db.get_airline(al_code)
+            if not a:
+                panel += Page.error(f"No airline with IATA code '{al_code}'.")
+            else:
+                panel += ("<form method='post' action='/edit'><input type='hidden' name='action' value='update_airline'>"
+                          f"<input type='hidden' name='iata' value='{html.escape(a.iata)}'><div class='fields'>"
+                          + field("id", "OpenFlights ID", a.id, True) + field("iata_ro", "IATA", a.iata, True)
+                          + "".join(field(f, nice.get(f, f.replace("_", " ").title()), getattr(a, f)) for f in AviationDatabase.AIRLINE_EDITABLE)
+                          + "</div><button>Save airline</button></form>")
+        panel += "</div>"
+        # airport editor
+        panel2 = ("<div class='panel'><h3>Edit an airport</h3>"
+                  "<form method='get' action='/edit'><label>Airport IATA code: "
+                  f"<input type='text' name='airport' value='{html.escape(ap_code)}'></label> <button>Open</button></form>")
+        if ap_code:
+            a = self.db.get_airport(ap_code)
+            if not a:
+                panel2 += Page.error(f"No airport with IATA code '{ap_code}'.")
+            else:
+                panel2 += ("<form method='post' action='/edit'><input type='hidden' name='action' value='update_airport'>"
+                           f"<input type='hidden' name='iata' value='{html.escape(a.iata)}'><div class='fields'>"
+                           + field("id", "OpenFlights ID", a.id, True) + field("iata_ro", "IATA", a.iata, True)
+                           + "".join(field(f, nice.get(f, f.replace("_", " ").title()), getattr(a, f)) for f in AviationDatabase.AIRPORT_EDITABLE)
+                           + "</div><button>Save airport</button></form>")
+        panel2 += "</div>"
+
+        route_form = lambda action, title, extra, btn, cls="": (
+            f"<div class='panel'><h3>{title}</h3><form method='post' action='/edit'>"
+            f"<input type='hidden' name='action' value='{action}'><div class='fields'>"
+            "<label>Airline (IATA)<input name='airline' placeholder='AA'></label>"
+            "<label>From airport (IATA)<input name='src' placeholder='SJC'></label>"
+            "<label>To airport (IATA)<input name='dst' placeholder='BOS'></label>"
+            f"{extra}</div><button{cls}>{btn}</button></form></div>")
+        add = route_form("add_route", "Add a route",
+                         "<label>Stops<input name='stops' value='0'></label>"
+                         "<label>Equipment (optional)<input name='equipment' placeholder='738'></label>", "Add route")
+        delete = route_form("delete_route", "Delete a route", "", "Delete route", " class='danger'")
+
+        if self.in_session and self.db.edits:
+            items = "".join(f"<li>{html.escape(e)}</li>" for e in self.db.edits)
+            changes = (f"<div class='panel'><h3>Your changes in this session ({len(self.db.edits)})</h3>"
+                       f"<ul class='changes'>{items}</ul>"
+                       "<form method='post' action='/edit'><input type='hidden' name='action' value='reset'>"
+                       "<button class='danger'>Reset - go back to the original data</button></form></div>")
+        else:
+            changes = "<div class='panel'><h3>Your changes in this session</h3><p class='count'>No changes yet.</p></div>"
+        body += changes + f"<div class='grid2'>{panel}{panel2}{add}{delete}</div>"
+        return self.render("Edit Data", body)
+
+    # ---------------------------------------------------------------- OO Code
+    def code_page(self, _):
+        path = os.path.abspath(__file__)
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        classes = []
+        for node in ast.parse(source).body:
+            if isinstance(node, ast.ClassDef):
+                methods = [n.name for n in node.body if isinstance(n, ast.FunctionDef)]
+                doc = (ast.get_docstring(node) or "").strip().split("\n")[0]
+                classes.append((node.name, doc, methods))
+        cards = "".join(
+            f"<div class='cls'><h4>class {html.escape(n)}</h4>"
+            + (f"<p>{html.escape(d)}</p>" if d else "")
+            + "".join(f"<code>{html.escape(m)}()</code>" for m in ms) + "</div>"
+            for n, d, ms in classes)
+        body = (f"<h2>Object-Oriented Code</h2>"
+                f"<p class='hint'>The whole application is one Python file, <b>app.py</b> "
+                f"({source.count(chr(10)):,} lines, {len(classes)} classes), using only the Python standard library.</p>"
+                f"<h3>Classes</h3><div class='class-list'>{cards}</div>"
+                f"<details class='src' open><summary>Full source code: app.py</summary>"
+                f"<pre class='code'><code class='language-python'>{html.escape(source)}</code></pre></details>")
+        head = ("<link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css'>"
+                "<script src='https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js'></script>")
+        js = "if (window.hljs) { document.querySelectorAll('pre.code code').forEach(function(b){ hljs.highlightElement(b); }); }"
+        return self.render("OO Code", body, extra_js=js, extra_head=head)
+
+    # ---------------------------------------------------------------- Contact
+    def contact(self, _):
+        mail = (f"<div class='row'><a class='btn-mail' href='mailto:{html.escape(CONTACT_EMAIL)}'>Email me</a>"
+                f"<span>{html.escape(CONTACT_EMAIL)}</span></div>") if CONTACT_EMAIL else ""
+        body = ("<h2>Contact</h2><div class='contact-card'>"
+                f"<p>Questions about this project or interested in working together? I'd be glad to hear from you.</p>"
+                f"<div class='row'><a class='btn-li' href='{LINKEDIN_URL}' target='_blank' rel='noopener'>"
+                f"Connect on LinkedIn</a></div>{mail}"
+                f"<p class='project'><b>{html.escape(STUDENT_NAME)}</b><br>CIS 51, De Anza College &middot; Cupertino, CA</p>"
+                "</div>")
+        return self.render("Contact", body)
 
     def about(self, _):
         photo = find_photo()
@@ -873,32 +1260,81 @@ class AviationWebApp:
                 "<p><b>Built with:</b> Python and globe.gl, created through Vibe Coding with an AI advisor "
                 "for CIS 51 at De Anza College.</p></div>"
                 "</div></div>")
-        return Page.render("About", body)
+        return self.render("About", body)
 
     def get_id(self, _):
         body = ("<h2>2.3 Site Owner</h2>"
                 + Page.entity(["Name", "De Anza Student ID"], [STUDENT_NAME, STUDENT_ID]))
-        return Page.render("Get ID", body)
+        return self.render("Get ID", body)
 
 
 # ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
 class RequestHandler(BaseHTTPRequestHandler):
-    app = None  # set in main()
+    """HTTP layer: picks the visitor's data (shared or session copy) and serves GET/POST requests."""
+    base_db = None   # shared, never modified - set in main()
+    sessions = None  # SessionStore - set in main()
+
+    def session_id(self):
+        for part in self.headers.get("Cookie", "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "sid":
+                return v
+        return None
+
+    def app_for_request(self):
+        db = self.sessions.get(self.session_id())
+        return AviationWebApp(db or self.base_db, in_session=db is not None)
 
     def do_GET(self):
         url = urlparse(self.path)
         path = url.path.rstrip("/") or "/"
         if path == "/photo":
             return self.send_photo()
-        status, page = self.app.handle(path, parse_qs(url.query))
+        status, page = self.app_for_request().handle(path, parse_qs(url.query))
         data = page.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
+
+    def do_POST(self):
+        if (urlparse(self.path).path.rstrip("/") or "/") != "/edit":
+            self.send_error(404)
+            return
+        length = min(int(self.headers.get("Content-Length") or 0), 100_000)
+        form = {k: v[0] for k, v in parse_qs(self.rfile.read(length).decode("utf-8"),
+                                             keep_blank_values=True).items()}
+        action = form.get("action", "")
+        sid = self.session_id()
+        new_cookie = None
+        back = {}
+        if action == "reset":
+            self.sessions.reset(sid)
+            back["msg"] = "All your changes were removed. You are seeing the original data again."
+        else:
+            db = self.sessions.get(sid)
+            if db is None:
+                sid, db = self.sessions.create()
+                new_cookie = sid
+            msg, err, extra = EditActions.run(db, action, form)
+            back.update(extra)
+            if msg:
+                back["msg"] = msg
+            if err:
+                back["err"] = err
+                back.pop("msg", None)
+        location = "/edit?" + urlencode({k: v for k, v in back.items() if v})
+        self.send_response(303)
+        self.send_header("Location", location)
+        if new_cookie:
+            # no Expires/Max-Age: a browser-session cookie, gone when the browser closes
+            self.send_header("Set-Cookie", f"sid={new_cookie}; Path=/; HttpOnly; SameSite=Lax")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
 
     def send_photo(self):
@@ -918,7 +1354,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 def main():
     db = AviationDatabase(DATA_DIR)
-    RequestHandler.app = AviationWebApp(db)
+    RequestHandler.base_db = db
+    RequestHandler.sessions = SessionStore(db)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), RequestHandler)
     print(f"Loaded {len(db.airlines_by_iata)} airlines, {len(db.airports_by_iata)} airports, "
           f"{len(db.routes)} routes")
