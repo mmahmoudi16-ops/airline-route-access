@@ -430,8 +430,8 @@ class Page:
     body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0;background:#f5f7fa;color:#1d2330}
     header{background:#1f3a5f;color:#fff;padding:14px max(24px, calc((100% - 1352px) / 2))}
     header a{color:#fff;text-decoration:none;font-size:20px;font-weight:600}
-    nav{background:#fff;border-bottom:1px solid #dde3ea;padding:8px max(24px, calc((100% - 1352px) / 2));display:flex;flex-wrap:wrap;gap:14px}
-    nav a{color:#1f3a5f;text-decoration:none;font-size:14px}
+    nav{background:#fff;border-bottom:1px solid #dde3ea;padding:8px max(24px, calc((100% - 1352px) / 2));display:flex;flex-wrap:wrap;gap:6px 12px}
+    nav a{color:#1f3a5f;text-decoration:none;font-size:13.5px;white-space:nowrap}
     nav a:hover{text-decoration:underline}
     main{padding:20px 24px;max-width:1400px;margin:0 auto;box-sizing:border-box}
     h2{margin-top:0}
@@ -479,7 +479,8 @@ class Page:
     .project{margin-top:18px;padding-top:6px;border-top:1px solid #eef1f5;color:#444}
     .project p{margin:8px 0}
     .project a{color:#1f3a5f}
-    nav a.nav2{margin-left:auto}
+    nav .nav2{margin-left:auto;display:flex;gap:12px}
+    nav a.active{font-weight:700;text-decoration:underline;text-underline-offset:4px}
     .panel{background:#fff;border:1px solid #dde3ea;border-radius:8px;padding:16px 18px;margin:0 0 16px}
     .panel h3{margin:0 0 10px}
     .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:16px;align-items:start}
@@ -781,7 +782,8 @@ class Page:
 })();
 """
 
-    NAV = [("/airline", "1.1 Airline Lookup"),
+    NAV = [("/", "⌂ Home"),
+           ("/airline", "1.1 Airline Lookup"),
            ("/airport", "1.2 Airport Lookup"),
            ("/report/airline-airports", "2.1a Airline → Airports"),
            ("/report/airport-airlines", "2.1b Airport → Airlines"),
@@ -798,9 +800,15 @@ class Page:
 
     @classmethod
     def render(cls, title, body, globe_data=None, extra_js="", banner="", extra_head=""):
-        nav = "".join("<a href='%s'%s>%s</a>" % (u, " class='nav2'" if u == cls.NAV_SECONDARY[0] else "",
-                                                  html.escape(t)) for u, t in cls.NAV)
-        scripts = f"<script>{extra_js}</script>" if extra_js else ""
+        link = lambda u, t: "<a href='%s'>%s</a>" % (u, html.escape(t))
+        nav = ("".join(link(u, t) for u, t in cls.NAV if u not in cls.NAV_SECONDARY)
+               + "<span class='nav2'>" + "".join(link(u, t) for u, t in cls.NAV if u in cls.NAV_SECONDARY)
+               + "</span>")
+        scripts = ("<script>(function(){var p=location.pathname.replace(/\\/$/,'')||'/';"
+                   "document.querySelectorAll('nav a').forEach(function(a){"
+                   "if(a.getAttribute('href')===p)a.classList.add('active');});})();</script>")
+        if extra_js:
+            scripts += f"<script>{extra_js}</script>"
         if globe_data is not None:
             data = json.dumps(globe_data).replace("</", "<\\/")
             scripts += (f"<script type='application/json' id='globe-data'>{data}</script>"
@@ -902,7 +910,7 @@ class AviationWebApp:
 
     def home(self, _):
         cards = "".join(f"<div class='card'><a href='{u}'>{html.escape(t)}</a></div>"
-                        for u, t in Page.NAV)
+                        for u, t in Page.NAV if u != "/")
         hero = (f"<div class='hero'>{Page.HERO_SVG}<div class='hero-text'>"
                 f"<h1>Air Travel Database</h1>"
                 f"<p>{len(self.db.airlines_by_iata)} airlines · {len(self.db.airports_by_iata)} airports · "
