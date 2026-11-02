@@ -26,6 +26,10 @@ Open `student_info.py` and fill in `STUDENT_NAME` and `STUDENT_ID` (used by repo
 - 2.2b All airports ordered by IATA code (live search by city, country, name, code; filter by country and by airline served)
 - 2.3 Site owner name and student ID
 - One Hop Routes (Additional 1): From/To airports + airline choice (any mix, same airline, or one specific airline); all non-stop route pairs S->X->D ordered by total GPS air miles; top 5 intermediate cities shown and labelled on the globe
+- Charts: headline numbers plus routes per airline, busiest airports, airports by country, route lengths
+- Edit Data: change airlines/airports, add or delete routes. Changes apply ONLY to the current browser session (other visitors never see them; closing the browser or Reset restores the original data)
+- OO Code: class overview and the full app.py source
+- Contact page (LinkedIn; optional email via CONTACT_EMAIL in student_info.py)
 - About page with LinkedIn link. To show your photo, put a file named photo.jpg (or photo.png) next to app.py
 - Animated home-page illustration (airliner taking off past an airport)
 - 3D globe (pages 1.2, 2.1a, 2.1b, One Hop): click a table row to show its routes as animated arcs; hover an arc for its air-mile distance. Needs internet (loads globe.gl from cdn.jsdelivr.net).
@@ -33,5 +37,5 @@ Open `student_info.py` and fill in `STUDENT_NAME` and `STUDENT_ID` (used by repo
 ## Files
 
 - `student_info.py` - your name and student ID
-- `app.py` - the whole application (classes: Airline, Airport, Route, AviationDatabase, Page, AviationWebApp)
+- `app.py` - the whole application (classes: Airline, Airport, Route, AviationDatabase, SessionStore, EditActions, Page, AviationWebApp, RequestHandler)
 - `data/` - SB-airlines.txt, SB-airports.txt, SB-routes.txt (OpenFlights format)
