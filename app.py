@@ -256,12 +256,12 @@ class _Leg:
 class Page:
     CSS = """
     body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0;background:#f5f7fa;color:#1d2330}
-    header{background:#1f3a5f;color:#fff;padding:14px 24px}
+    header{background:#1f3a5f;color:#fff;padding:14px max(24px, calc((100% - 1352px) / 2))}
     header a{color:#fff;text-decoration:none;font-size:20px;font-weight:600}
-    nav{background:#fff;border-bottom:1px solid #dde3ea;padding:8px 24px;display:flex;flex-wrap:wrap;gap:14px}
+    nav{background:#fff;border-bottom:1px solid #dde3ea;padding:8px max(24px, calc((100% - 1352px) / 2));display:flex;flex-wrap:wrap;gap:14px}
     nav a{color:#1f3a5f;text-decoration:none;font-size:14px}
     nav a:hover{text-decoration:underline}
-    main{padding:20px 24px;max-width:1200px}
+    main{padding:20px 24px;max-width:1400px;margin:0 auto;box-sizing:border-box}
     h2{margin-top:0}
     form{margin:10px 0 18px}
     select{padding:7px 8px;font-size:15px;border:1px solid #b8c2cf;border-radius:4px;background:#fff}
