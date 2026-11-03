@@ -474,12 +474,13 @@ class Page:
     .hint{color:#555;font-size:13px;margin:-6px 0 8px}
     .hero{position:relative;border-radius:10px;overflow:hidden;margin-bottom:18px;line-height:0;box-shadow:0 2px 10px rgba(0,0,0,.12)}
     .hero svg{width:100%;height:auto;display:block}
-    .hero-photo{position:relative;aspect-ratio:1200/340;overflow:hidden;background:#0b3d6e}
-    .hero-photo img{width:100%;height:100%;object-fit:cover;display:block;animation:heroZoom 24s ease-in-out infinite alternate}
-    .hero-photo::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,rgba(5,20,40,.62) 0%,rgba(5,20,40,.25) 45%,rgba(5,20,40,0) 70%)}
+    .hero-photo{position:relative;aspect-ratio:1200/462;overflow:hidden;background:#0b3d6e}
+    .hero-photo img{width:100%;height:100%;object-fit:cover;object-position:center 20%;transform-origin:center 25%;display:block;animation:heroZoom 24s ease-in-out infinite alternate}
+    .hero-photo::after{content:"";position:absolute;inset:0;background:linear-gradient(0deg,rgba(5,20,40,.78) 0%,rgba(5,20,40,.35) 28%,rgba(5,20,40,0) 50%)}
+    .hero.has-photo .hero-text{top:auto;bottom:clamp(12px,3vw,30px)}
     @keyframes heroZoom{from{transform:scale(1)}to{transform:scale(1.08)}}
     @media(prefers-reduced-motion:reduce){.hero-photo img{animation:none}}
-    @media(max-width:600px){.hero-photo{aspect-ratio:16/7}}
+    @media(max-width:600px){.hero-photo{aspect-ratio:16/8}}
     .hero-text{position:absolute;left:clamp(14px,3vw,36px);top:clamp(12px,3vw,32px);color:#fff;line-height:1.25;text-shadow:0 2px 6px rgba(0,0,0,.35)}
     .hero-text h1{margin:0;font-size:clamp(20px,3.6vw,40px)}
     .hero-text p{margin:6px 0 0;font-size:clamp(12px,1.5vw,17px);opacity:.95}
@@ -928,7 +929,7 @@ class AviationWebApp:
                         for u, t in Page.NAV if u != "/")
         art = ("<div class='hero-photo'><img src='/hero' alt='Airplane at an airport'></div>"
                if find_hero() else Page.HERO_SVG)
-        hero = (f"<div class='hero'>{art}<div class='hero-text'>"
+        hero = (f"<div class='hero{' has-photo' if find_hero() else ''}'>{art}<div class='hero-text'>"
                 f"<h1>Air Travel Database</h1>"
                 f"<p>{len(self.db.airlines_by_iata)} airlines · {len(self.db.airports_by_iata)} airports · "
                 f"{len(self.db.routes):,} routes</p></div></div>")
