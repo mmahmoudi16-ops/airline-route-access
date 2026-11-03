@@ -34,17 +34,26 @@ except ImportError:
     CONTACT_EMAIL = ""
 
 LINKEDIN_URL = "https://www.linkedin.com/in/maryam-mahmoudi-ab5422304"
-PHOTO_NAMES = ["photo.jpg", "photo.jpeg", "photo.png", "photo.webp"]
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def find_photo():
-    """Path of the owner's photo if one has been placed next to app.py."""
-    for name in PHOTO_NAMES:
-        path = os.path.join(APP_DIR, name)
+def find_image(base):
+    """Path of base.jpg / .jpeg / .png / .webp placed next to app.py, or None."""
+    for ext in ("jpg", "jpeg", "png", "webp"):
+        path = os.path.join(APP_DIR, f"{base}.{ext}")
         if os.path.isfile(path):
             return path
     return None
+
+
+def find_photo():
+    """The owner's photo for the About page (photo.jpg)."""
+    return find_image("photo")
+
+
+def find_hero():
+    """Optional real photo for the home-page banner (hero.jpg); the drawn illustration is used if absent."""
+    return find_image("hero")
 
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -465,6 +474,12 @@ class Page:
     .hint{color:#555;font-size:13px;margin:-6px 0 8px}
     .hero{position:relative;border-radius:10px;overflow:hidden;margin-bottom:18px;line-height:0;box-shadow:0 2px 10px rgba(0,0,0,.12)}
     .hero svg{width:100%;height:auto;display:block}
+    .hero-photo{position:relative;aspect-ratio:1200/340;overflow:hidden;background:#0b3d6e}
+    .hero-photo img{width:100%;height:100%;object-fit:cover;display:block;animation:heroZoom 24s ease-in-out infinite alternate}
+    .hero-photo::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,rgba(5,20,40,.62) 0%,rgba(5,20,40,.25) 45%,rgba(5,20,40,0) 70%)}
+    @keyframes heroZoom{from{transform:scale(1)}to{transform:scale(1.08)}}
+    @media(prefers-reduced-motion:reduce){.hero-photo img{animation:none}}
+    @media(max-width:600px){.hero-photo{aspect-ratio:16/7}}
     .hero-text{position:absolute;left:clamp(14px,3vw,36px);top:clamp(12px,3vw,32px);color:#fff;line-height:1.25;text-shadow:0 2px 6px rgba(0,0,0,.35)}
     .hero-text h1{margin:0;font-size:clamp(20px,3.6vw,40px)}
     .hero-text p{margin:6px 0 0;font-size:clamp(12px,1.5vw,17px);opacity:.95}
@@ -911,7 +926,9 @@ class AviationWebApp:
     def home(self, _):
         cards = "".join(f"<div class='card'><a href='{u}'>{html.escape(t)}</a></div>"
                         for u, t in Page.NAV if u != "/")
-        hero = (f"<div class='hero'>{Page.HERO_SVG}<div class='hero-text'>"
+        art = ("<div class='hero-photo'><img src='/hero' alt='Airplane at an airport'></div>"
+               if find_hero() else Page.HERO_SVG)
+        hero = (f"<div class='hero'>{art}<div class='hero-text'>"
                 f"<h1>Air Travel Database</h1>"
                 f"<p>{len(self.db.airlines_by_iata)} airlines · {len(self.db.airports_by_iata)} airports · "
                 f"{len(self.db.routes):,} routes</p></div></div>")
@@ -1299,7 +1316,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         path = url.path.rstrip("/") or "/"
         if path == "/photo":
-            return self.send_photo()
+            return self.send_image(find_photo())
+        if path == "/hero":
+            return self.send_image(find_hero())
         status, page = self.app_for_request().handle(path, parse_qs(url.query))
         data = page.encode("utf-8")
         self.send_response(status)
@@ -1345,8 +1364,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-    def send_photo(self):
-        photo = find_photo()
+    def send_image(self, photo):
         if not photo:
             self.send_error(404)
             return
