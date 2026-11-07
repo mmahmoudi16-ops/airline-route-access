@@ -34,6 +34,10 @@ except ImportError:
     CONTACT_EMAIL = ""
 
 LINKEDIN_URL = "https://www.linkedin.com/in/maryam-mahmoudi-ab5422304"
+try:  # optional: link to the code on GitHub in the footer ("" hides it)
+    from student_info import GITHUB_URL
+except ImportError:
+    GITHUB_URL = "https://github.com/mmahmoudi16-ops/airline-route-access"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -157,6 +161,93 @@ class AviationDatabase:
     def get_airport(self, iata):
         return self.airports_by_iata.get(iata.strip().upper())
 
+    # ---- Smart search: find airports / airlines from a city, name, country or code ----
+    @staticmethod
+    def _norm(s):
+        import unicodedata
+        s = unicodedata.normalize("NFD", s or "")
+        return "".join(c for c in s if unicodedata.category(c) != "Mn").lower().strip()
+
+    def search_airports(self, q, limit=8):
+        q = self._norm(q)
+        if not q:
+            return []
+        scored = []
+        for a in self.airports_by_iata.values():
+            iata, city, name, country = (self._norm(x) for x in (a.iata, a.city, a.name, a.country))
+            if iata == q:
+                s = 0
+            elif city == q:
+                s = 1
+            elif city.startswith(q):
+                s = 2
+            elif iata.startswith(q) or self._norm(a.icao) == q:
+                s = 3
+            elif any(w.startswith(q) for w in name.split()) or name.startswith(q):
+                s = 4
+            elif country.startswith(q):
+                s = 6
+            elif q in city or q in name:
+                s = 5
+            else:
+                continue
+            scored.append((s, a.city, a.iata, a))
+        scored.sort(key=lambda x: x[:3])
+        return [x[3] for x in scored[:limit]]
+
+    def search_airlines(self, q, limit=8):
+        q = self._norm(q)
+        if not q:
+            return []
+        scored = []
+        for a in self.airlines_by_iata.values():
+            iata, name, alias, country, cs = (self._norm(x) for x in (a.iata, a.name, a.alias, a.country, a.callsign))
+            if iata == q or self._norm(a.icao) == q:
+                s = 0
+            elif name.startswith(q) or cs.startswith(q) or (alias and alias.startswith(q)):
+                s = 1
+            elif any(w.startswith(q) for w in name.split()):
+                s = 2
+            elif q in name:
+                s = 3
+            elif country.startswith(q):
+                s = 4
+            else:
+                continue
+            scored.append((s, a.iata, a))
+        scored.sort(key=lambda x: x[:2])
+        return [x[2] for x in scored[:limit]]
+
+    def resolve_airport(self, q):
+        """(airport, suggestions): exact IATA code first, else a single clear match by city/name."""
+        a = self.get_airport(q)
+        if a:
+            return a, []
+        found = self.search_airports(q)
+        exact_city = [x for x in found if self._norm(x.city) == self._norm(q)]
+        if len(found) == 1:
+            return found[0], []
+        if len(exact_city) == 1:
+            return exact_city[0], []
+        return None, found
+
+    def resolve_airline(self, q):
+        a = self.get_airline(q)
+        if a:
+            return a, []
+        found = self.search_airlines(q)
+        by_name = [x for x in found if self._norm(q) in self._norm(x.name)]
+        if len(found) == 1:
+            return found[0], []
+        if len(by_name) == 1:
+            return by_name[0], []
+        return None, found
+
+    def lookup_data(self):
+        """Compact lists used by the search boxes' suggestions."""
+        return {"airports": [[a.iata, a.name, a.city, a.country] for a in self.all_airports()],
+                "airlines": [[a.iata, a.name, a.country] for a in self.all_airlines()]}
+
     # 2.1a  airports reached by an airline, ordered by # routes
     def airports_for_airline(self, airline):
         counts = Counter()
@@ -192,6 +283,29 @@ class AviationDatabase:
         airline_names = {a.iata: a.name for a in self.airlines_by_iata.values()}
         return {"airports": airports, "routes": segs, "focus": focus,
                 "airlines": airline_names}
+
+    def destinations(self, airport):
+        """Every airport connected to this one, with # routes, airlines, direction and air miles."""
+        info = {}
+        for r in self.routes:
+            if airport.id not in (r.source_id, r.dest_id):
+                continue
+            other_id = r.dest_id if r.source_id == airport.id else r.source_id
+            other, al = self.airports_by_id.get(other_id), self.airlines_by_id.get(r.airline_id)
+            if not other or not al or other is airport:
+                continue
+            d = info.setdefault(other_id, {"airport": other, "count": 0, "airlines": set(), "dirs": set()})
+            d["count"] += 1
+            d["airlines"].add(al.iata)
+            d["dirs"].add("out" if r.source_id == airport.id else "in")
+        rows = []
+        for d in info.values():
+            d["airlines"] = sorted(d["airlines"])
+            d["direction"] = {frozenset({"out", "in"}): "Both ways", frozenset({"out"}): "Departing only",
+                              frozenset({"in"}): "Arriving only"}[frozenset(d["dirs"])]
+            d["miles"] = airport.miles_to(d["airport"])
+            rows.append(d)
+        return sorted(rows, key=lambda d: (-d["count"], d["airport"].iata))
 
     def routes_of_airline(self, airline):
         return [r for r in self.routes if r.airline_id == airline.id]
@@ -321,31 +435,56 @@ class AviationDatabase:
         return removed
 
     # ---- Statistics for the Charts page ----
-    def stats(self):
+    def stats(self, airline=None):
+        """Numbers for the Charts page; with an airline, only that airline's routes are counted."""
+        routes = [r for r in self.routes if airline is None or r.airline_id == airline.id]
         dist = {}
-        for r in self.routes:
+        per_airport = Counter()
+        for r in routes:
             s, d = self.airports_by_id.get(r.source_id), self.airports_by_id.get(r.dest_id)
             if s and d:
                 dist[(r.source_id, r.dest_id)] = (s, d, s.miles_to(d))
+                per_airport[r.source_id] += 1
+                per_airport[r.dest_id] += 1
         miles = [v[2] for v in dist.values()]
         longest = max(dist.values(), key=lambda v: v[2]) if dist else None
         per_airline = Counter(r.airline_id for r in self.routes)
-        per_airport = Counter()
-        for r in self.routes:
-            per_airport[r.source_id] += 1
-            per_airport[r.dest_id] += 1
-        buckets = [("0-500", 0, 500), ("500-1,000", 500, 1000), ("1,000-2,000", 1000, 2000),
-                   ("2,000-3,000", 2000, 3000), ("3,000-5,000", 3000, 5000), ("5,000+", 5000, 1e9)]
+        split = {}
+        for r in self.routes:  # domestic vs international, always for every airline
+            s, d = self.airports_by_id.get(r.source_id), self.airports_by_id.get(r.dest_id)
+            if s and d and r.airline_id in self.airlines_by_id:
+                dom, intl = split.get(r.airline_id, (0, 0))
+                split[r.airline_id] = (dom + 1, intl) if s.country == d.country else (dom, intl + 1)
+        buckets = [("under 500", 0, 500), ("500–1k", 500, 1000), ("1k–2k", 1000, 2000),
+                   ("2k–3k", 2000, 3000), ("3k–5k", 3000, 5000), ("5k+", 5000, 1e9)]
+        served = [self.airports_by_id[k] for k in per_airport if k in self.airports_by_id]
+        pairs, foreign = {}, Counter()
+        for r in routes:
+            s, d = self.airports_by_id.get(r.source_id), self.airports_by_id.get(r.dest_id)
+            al = self.airlines_by_id.get(r.airline_id)
+            if not (s and d and al):
+                continue
+            a_, b_ = sorted((s, d), key=lambda x: x.iata)
+            entry = pairs.setdefault((a_.iata, b_.iata), [a_, b_, s.miles_to(d), set()])
+            entry[3].add(al.iata)
+            if d.country != al.country:
+                foreign[d.country] += 1
         return {
+            "n_routes": len(routes),
+            "n_airports": len(served),
+            "n_countries": len({a.country for a in served}),
             "routes_per_airline": sorted(((self.airlines_by_id[k], n) for k, n in per_airline.items()
                                           if k in self.airlines_by_id), key=lambda x: -x[1]),
+            "domestic_split": sorted(((self.airlines_by_id[k], dom, intl) for k, (dom, intl) in split.items()),
+                                     key=lambda x: -(x[1] + x[2])),
             "busiest_airports": [(self.airports_by_id[k], n) for k, n in per_airport.most_common(15)
                                  if k in self.airports_by_id],
-            "countries": Counter(a.country for a in self.airports_by_iata.values()).most_common(10),
+            "airport_counts": [(self.airports_by_id[k], n) for k, n in per_airport.items() if k in self.airports_by_id],
             "length_buckets": [(lbl, sum(1 for m in miles if lo <= m < hi)) for lbl, lo, hi in buckets],
             "longest": longest,
+            "longest_routes": sorted(pairs.values(), key=lambda v: -v[2])[:10],
+            "foreign_countries": foreign.most_common(10),
             "avg_miles": sum(miles) / len(miles) if miles else 0,
-            "n_countries": len({a.country for a in self.airports_by_iata.values()}),
         }
 
     # 2.2a / 2.2b
@@ -436,12 +575,9 @@ class EditActions:
 class Page:
     """Builds the HTML: page layout, styles, tables, forms, the globe and the search bar."""
     CSS = """
-    body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0;background:#f5f7fa;color:#1d2330}
-    header{background:#1f3a5f;color:#fff;padding:14px max(24px, calc((100% - 1352px) / 2))}
-    header a{color:#fff;text-decoration:none;font-size:20px;font-weight:600}
-    nav{background:#fff;border-bottom:1px solid #dde3ea;padding:8px max(24px, calc((100% - 1352px) / 2));display:flex;flex-wrap:wrap;gap:6px 12px}
-    nav a{color:#1f3a5f;text-decoration:none;font-size:13.5px;white-space:nowrap}
-    nav a:hover{text-decoration:underline}
+    body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0;background:#f5f7fa;color:#1d2330;min-height:100vh;display:flex;flex-direction:column}
+    body>main{flex:1;width:100%}
+    .hint a,.suggest a{color:#2f6fa3;font-weight:600}
     main{padding:20px 24px;max-width:1400px;margin:0 auto;box-sizing:border-box}
     h2{margin-top:0}
     form{margin:10px 0 18px}
@@ -455,6 +591,25 @@ class Page:
     .filters .clear{background:#e8edf3;color:#1f3a5f}
     .noresult td{color:#888;text-align:center;padding:18px}
     input[type=text]{padding:7px 10px;font-size:15px;width:120px;text-transform:uppercase;border:1px solid #b8c2cf;border-radius:4px}
+    input.ac{width:min(320px,100%);text-transform:none;padding:9px 12px;border-radius:8px;box-sizing:border-box}
+    input.ac:focus{outline:2px solid #2f6fa3;outline-offset:0;border-color:#2f6fa3}
+    .ac-wrap{position:relative;display:inline-block;vertical-align:middle;max-width:100%}
+    .ac-list{position:absolute;left:0;top:calc(100% + 4px);z-index:40;width:max(100%,380px);max-width:calc(100vw - 32px);background:#fff;border:1px solid #dde3ea;border-radius:10px;box-shadow:0 12px 28px rgba(15,30,60,.16);list-style:none;margin:0;padding:6px;display:none}
+    .ac-list.show{display:block}
+    .ac-list li{display:flex;gap:10px;align-items:baseline;padding:7px 9px;border-radius:7px;cursor:pointer;font-size:14px}
+    .ac-list li b{font-family:ui-monospace,Consolas,monospace;color:#1f3a5f;min-width:34px}
+    .ac-list li span{color:#1d2330}
+    .ac-list li small{color:#5b6b7d;margin-left:auto;white-space:nowrap;padding-left:8px}
+    .ac-list li.on,.ac-list li:hover{background:#e8f0f9}
+    .lookup-form{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:flex-end;margin:6px 0 10px}
+    .lookup-form label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:#4f6b8a;font-weight:600}
+    .lookup-form button{padding:9px 18px;border-radius:8px}
+    .examples{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 16px;font-size:13px;color:#5b6b7d}
+    .examples a{background:#fff;border:1px solid #c9d5e3;color:#1f3a5f;text-decoration:none;border-radius:16px;padding:4px 12px;font-weight:500}
+    .examples a:hover{border-color:#1f3a5f;background:#f1f5fa}
+    .suggest{background:#fff;border:1px solid #f0d77a;background:#fffbea;border-radius:10px;padding:12px 14px;margin:6px 0 16px}
+    .suggest p{margin:0 0 8px;color:#6b5300}
+    .suggest .examples{margin:0}
     button{padding:7px 14px;font-size:15px;background:#1f3a5f;color:#fff;border:0;border-radius:4px;cursor:pointer}
     .scroll{max-height:70vh;overflow:auto;border:1px solid #dde3ea;background:#fff}
     table{border-collapse:collapse;width:100%;font-size:14px}
@@ -472,6 +627,77 @@ class Page:
     .globe-info b{color:#ffd166}
     .globe-msg{color:#cfd8e3;padding:60px 20px 20px}
     .hint{color:#555;font-size:13px;margin:-6px 0 8px}
+    header.topbar{background:#1f3a5f;position:sticky;top:0;z-index:60;box-shadow:0 2px 8px rgba(10,25,50,.25)}
+    .topbar-in{display:flex;align-items:stretch;gap:20px;padding:0 max(24px, calc((100% - 1352px) / 2))}
+    .brand{display:flex;align-items:center;gap:9px;color:#fff;font-weight:700;font-size:18px;text-decoration:none;white-space:nowrap;padding:12px 0}
+    .brand svg{width:24px;height:24px;color:#ffd166}
+    .page-head{display:flex;gap:14px;align-items:center;margin:4px 0 14px}
+    .page-head .ic{flex:none;width:46px;height:46px;border-radius:12px;background:#1f3a5f;color:#fff;display:flex;align-items:center;justify-content:center}
+    .page-head .ic svg{width:24px;height:24px}
+    .page-head h1{margin:0;font-size:24px;line-height:1.2}
+    .page-head h1 em{font-style:normal;font-size:12px;font-weight:600;color:#4f6b8a;background:#e8edf3;border-radius:5px;padding:2px 7px;margin-left:8px;vertical-align:4px}
+    .page-head p{margin:3px 0 0;color:#5b6b7d;font-size:14px}
+    footer.site-foot{background:#14284a;color:#cfd8e3;margin-top:36px}
+    .foot-in{max-width:1352px;margin:0 auto;padding:26px 24px;display:grid;grid-template-columns:2fr 1fr 1fr;gap:24px;font-size:14px;line-height:1.6;box-sizing:border-box}
+    .foot-in h4{margin:0 0 8px;color:#fff;font-size:14px}
+    .foot-in a{color:#cfe3ff;text-decoration:none}
+    .foot-in a:hover{text-decoration:underline}
+    .foot-in .brand{padding:0 0 6px}
+    .foot-bottom{border-top:1px solid rgba(255,255,255,.1);text-align:center;font-size:12.5px;padding:10px 24px;color:#9fb0c6}
+    @media(max-width:700px){.foot-in{grid-template-columns:1fr}}
+    .info-card{background:#fff;border:1px solid #dde3ea;border-radius:14px;padding:18px 20px;margin:4px 0 18px;box-shadow:0 2px 8px rgba(15,30,60,.05)}
+    .ic-head{display:flex;gap:16px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+    .code-badge{font:700 30px ui-monospace,Consolas,monospace;letter-spacing:1px;color:#fff;background:linear-gradient(135deg,#1f3a5f,#2f6fa3);border-radius:12px;padding:10px 16px;line-height:1}
+    .ic-head h2{margin:0;font-size:22px}
+    .ic-head p{margin:4px 0 0;color:#4f6b8a;font-size:14px}
+    .pill{display:inline-block;font-size:12px;font-weight:600;border-radius:12px;padding:2px 9px;margin-left:6px;vertical-align:2px}
+    .pill.on{background:#e6f4ea;color:#1e5b2c}
+    .pill.off{background:#eef1f5;color:#5b6b7d}
+    .localtime{font-weight:600;color:#1d2330}
+    .facts{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px}
+    .fact{background:#f6f8fb;border:1px solid #e6ebf2;border-radius:10px;padding:9px 12px}
+    .fact .k{display:block;font-size:11.5px;text-transform:uppercase;letter-spacing:.4px;color:#5b6b7d;font-weight:600}
+    .fact .v{display:block;font-size:15px;font-weight:600;color:#1d2330;margin-top:2px;word-break:break-word}
+    .fact .v small{font-weight:500;color:#5b6b7d}
+    .fact.stat{background:#e8f0f9;border-color:#d3e1f1}
+    .fact.stat .v{font-size:20px;color:#1f3a5f}
+    details.raw{margin-top:12px}
+    details.raw summary{cursor:pointer;color:#1f3a5f;font-weight:600;font-size:14px;padding:4px 0}
+    .trips{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px;margin:0 0 16px}
+    button.trip{display:block;text-align:left;width:100%;background:#fff;color:#1d2330;border:1px solid #dde3ea;border-radius:14px;padding:14px 16px;cursor:pointer;font:inherit;position:relative;overflow:hidden;box-shadow:0 2px 8px rgba(15,30,60,.05)}
+    button.trip:hover{border-color:#9fb6d0}
+    button.trip.sel{border-color:#1f3a5f;box-shadow:0 0 0 2px #1f3a5f inset}
+    .trip-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+    .trip-rank{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#fff;background:#2f6fa3;border-radius:6px;padding:3px 8px}
+    .trip-rank.best{background:#1e7a46}
+    .trip-total{font-size:20px;font-weight:700;color:#1f3a5f}
+    .trip-total small{display:block;font-size:12px;font-weight:500;color:#5b6b7d;text-align:right}
+    .trip-path{display:flex;align-items:center;gap:6px}
+    .trip-path .stop{text-align:center;min-width:54px}
+    .trip-path .stop b{display:block;font:700 18px ui-monospace,Consolas,monospace;color:#1d2330}
+    .trip-path .stop small{display:block;font-size:11.5px;color:#5b6b7d;max-width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .trip-path .stop.mid b{color:#2f6fa3}
+    .trip-path .leg{flex:1;text-align:center;font-size:11.5px;color:#5b6b7d}
+    .trip-path .leg .line{display:block;height:2px;margin:4px 0;background:repeating-linear-gradient(90deg,#9fb6d0 0 6px,transparent 6px 10px);position:relative}
+    .trip-path .leg .line:after{content:"✈";position:absolute;right:-2px;top:-9px;font-size:13px;color:#1f3a5f}
+    .trip-path .leg .al{font-weight:700;color:#1f3a5f}
+    .gtag{position:relative;top:-22px;pointer-events:none;background:rgba(8,18,40,.82);color:#fff;border:1px solid #ffd166;border-radius:7px;padding:3px 8px;font:12px system-ui,Segoe UI,Arial,sans-serif;white-space:nowrap;text-align:center;box-shadow:0 2px 6px rgba(0,0,0,.4)}
+    .gtag b{display:block;font:700 13px ui-monospace,Consolas,monospace;letter-spacing:.5px}
+    .gtag span{display:block;font-size:11px;opacity:.85}
+    .gtag.mark{border-color:#ef476f}
+    .globe-loading{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:#cfd8e3;font-size:14px;z-index:1;pointer-events:none}
+    .spin{width:34px;height:34px;border-radius:50%;border:3px solid rgba(255,255,255,.2);border-top-color:#ffd166;animation:spin 1s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    @media(max-width:640px){
+      table.rt thead{display:none}
+      table.rt,table.rt tbody,table.rt tr{display:block;width:100%}
+      table.rt tr{border-bottom:1px solid #dde3ea;padding:6px 0}
+      table.rt td{display:flex;justify-content:space-between;gap:12px;white-space:normal;border:0;padding:3px 12px;text-align:right}
+      table.rt td::before{content:attr(data-label);font-weight:600;color:#5b6b7d;text-align:left;flex:none;max-width:45%}
+      .scroll{max-height:none}
+      .page-head h1{font-size:20px}
+      .trip-path .stop small{max-width:64px}
+    }
     .hero{position:relative;border-radius:10px;overflow:hidden;margin-bottom:18px;line-height:0;box-shadow:0 2px 10px rgba(0,0,0,.12)}
     .hero svg{width:100%;height:auto;display:block}
     .hero-photo{position:relative;aspect-ratio:1200/462;overflow:hidden;background:#0b3d6e}
@@ -495,9 +721,55 @@ class Page:
     .project{margin-top:18px;padding-top:6px;border-top:1px solid #eef1f5;color:#444}
     .project p{margin:8px 0}
     .project a{color:#1f3a5f}
-    nav .nav2{margin-left:auto;display:flex;gap:12px}
-    nav a.active{font-weight:700;text-decoration:underline;text-underline-offset:4px}
-    .panel{background:#fff;border:1px solid #dde3ea;border-radius:8px;padding:16px 18px;margin:0 0 16px}
+    nav.mainnav{display:flex;flex:1;min-width:0}
+    .nav-list{list-style:none;margin:0;padding:0;display:flex;align-items:stretch;gap:2px;flex:1}
+    .nav-item{position:relative;display:flex}
+    .nav-item.right{margin-left:auto}
+    .nav-top,button.nav-top{display:flex;align-items:center;gap:7px;padding:13px 12px;font:500 14.5px system-ui,Segoe UI,Arial,sans-serif;color:rgba(255,255,255,.88);background:none;border:0;border-radius:0;cursor:pointer;text-decoration:none;white-space:nowrap;box-sizing:border-box}
+    .nav-top svg{width:19px;height:19px;flex:none}
+    .nav-top .chev{width:14px;height:14px;opacity:.6;transition:transform .2s}
+    .nav-top:hover,.has-sub:hover>.nav-top,.has-sub.open>.nav-top{background:rgba(255,255,255,.1);color:#fff}
+    .nav-item.active>.nav-top{color:#fff;box-shadow:inset 0 -3px 0 #ffd166}
+    .sub{position:absolute;top:100%;left:0;min-width:320px;margin-top:0;background:#fff;border:1px solid #dde3ea;border-radius:12px;box-shadow:0 14px 32px rgba(15,30,60,.18);padding:8px;display:none}
+    .nav-item.right .sub{left:auto;right:0}
+    .has-sub:hover>.sub,.has-sub:focus-within>.sub,.has-sub.open>.sub{display:block}
+    .has-sub:hover .chev,.has-sub.open .chev{transform:rotate(180deg)}
+    .sub-link{display:flex;gap:12px;align-items:center;padding:9px 10px;border-radius:9px;text-decoration:none;color:#1d2330}
+    .sub-link:hover,.sub-link:focus{background:#f1f5fa;outline:none}
+    .sub-link.active{background:#e8f0f9}
+    .sub-link .ic{flex:none;width:38px;height:38px;border-radius:10px;background:#e8f0f9;color:#1f3a5f;display:flex;align-items:center;justify-content:center}
+    .sub-link:hover .ic,.sub-link.active .ic{background:#1f3a5f;color:#fff}
+    .sub-link .ic svg{width:20px;height:20px}
+    .sub-link b{display:block;font-size:14px;font-weight:600}
+    .sub-link em{font-style:normal;font-size:11px;font-weight:600;color:#4f6b8a;background:#eef1f5;border-radius:4px;padding:1px 6px;margin-left:7px;vertical-align:1px}
+    .sub-link small{display:block;color:#5b6b7d;font-size:12.5px;margin-top:2px}
+    .nav-toggle,button.nav-toggle{display:none;align-items:center;gap:8px;background:none;color:#fff;border:0;padding:12px 0;margin-left:auto;font:600 15px system-ui,Segoe UI,Arial,sans-serif;cursor:pointer}
+    .nav-toggle svg{width:22px;height:22px}
+    @media(max-width:1080px){
+      .nav-toggle,button.nav-toggle{display:flex}
+      nav.mainnav{position:static;justify-content:flex-end}
+      .nav-list{display:none;flex-direction:column;position:absolute;top:100%;left:0;right:0;background:#fff;padding:8px 20px 14px;box-shadow:0 14px 28px rgba(10,25,50,.25);max-height:calc(100vh - 60px);overflow:auto}
+      nav.mainnav.open .nav-list{display:flex}
+      .nav-top,button.nav-top{color:#1f3a5f}
+      .nav-top:hover,.has-sub:hover>.nav-top{background:#f1f5fa;color:#1f3a5f}
+      .nav-item.active>.nav-top{color:#0b5cad}
+      .nav-item.right{margin-left:0}
+      .nav-item{display:block}
+      .nav-top,button.nav-top{padding:10px 4px;width:100%}
+      .nav-top .chev{display:none}
+      .nav-item.active>.nav-top{box-shadow:none}
+      .sub,.has-sub:hover>.sub{position:static;display:block;box-shadow:none;border:0;padding:0 0 4px 22px;min-width:0}
+      .sub-link{padding:6px 8px}
+      .sub-link small{display:none}
+      .sub-link .ic{width:30px;height:30px;border-radius:8px}
+      .sub-link .ic svg{width:17px;height:17px}
+    }
+    .home-group{margin:0 0 18px}
+    .home-group h2{display:flex;align-items:center;gap:9px;font-size:17px;margin:0 0 10px;color:#1f3a5f}
+    .home-group h2 svg{width:21px;height:21px}
+    .home-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+    .home-card{background:#fff;border:1px solid #dde3ea;border-radius:12px;padding:12px 14px;transition:box-shadow .15s,border-color .15s,transform .15s}
+    .home-card:hover{border-color:#9fb6d0;box-shadow:0 6px 18px rgba(15,30,60,.10);transform:translateY(-1px)}    .panel{background:#fff;border:1px solid #dde3ea;border-radius:8px;padding:16px 18px;margin:0 0 16px}
     .panel h3{margin:0 0 10px}
     .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:16px;align-items:start}
     .fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:8px 14px;margin:8px 0 12px}
@@ -514,12 +786,33 @@ class Page:
     .tile .l{font-size:13px;color:#5b6b7d;margin-top:4px}
     .chart{background:#fff;border:1px solid #dde3ea;border-radius:8px;padding:16px 18px}
     .chart h3{margin:0 0 2px;font-size:16px}
-    .chart .sub{margin:0 0 12px;color:#5b6b7d;font-size:13px}
+    .chart .csub{margin:0 0 12px;color:#5b6b7d;font-size:13px}
     .bar-row{display:grid;grid-template-columns:150px 1fr;align-items:center;gap:10px;padding:3px 0;font-size:13px}
     .bar-row .lbl{color:#1d2330;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .bar-track{position:relative;height:18px}
     .bar{height:100%;background:#2f6fa3;border-radius:0 4px 4px 0;min-width:2px;position:relative}
     .bar-row:hover .bar{background:#1f3a5f}
+    .bar-row.dim{opacity:.32}
+    .cgrid{grid-template-columns:repeat(auto-fit,minmax(min(100%,520px),1fr))}
+    .bar-track.stack{display:flex;align-items:center;gap:2px}
+    .seg{display:block;height:18px;min-width:2px}
+    .seg.dom{background:#2f6fa3;border-radius:0}
+    .seg.intl{background:#e08a2e;border-radius:0 4px 4px 0}
+    .seg-val{margin-left:6px;font-size:12px;color:#1d2330;white-space:nowrap}
+    .legend{display:flex;gap:16px;font-size:12.5px;color:#4f6b8a;margin:-4px 0 10px}
+    .legend .sw{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+    .sw.dom{background:#2f6fa3}.sw.intl{background:#e08a2e}
+    .cols{display:flex;align-items:stretch;gap:10px;height:230px;padding:4px 4px 0}
+    .col{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;min-width:0}
+    .cbar{width:100%;max-width:64px;background:#2f6fa3;border-radius:4px 4px 0 0;transition:background .15s}
+    .col:hover .cbar{background:#1f3a5f}
+    .cval{font-size:12px;font-weight:600;color:#1d2330;margin-bottom:4px}
+    .clbl{font-size:11.5px;color:#5b6b7d;margin-top:6px;text-align:center;white-space:nowrap}
+    .filter-row{margin:0 0 6px}
+    a.fchip{background:#fff;border:1px solid #c9d5e3;color:#1f3a5f;text-decoration:none;border-radius:16px;padding:5px 12px;font-size:13px}
+    a.fchip:hover{border-color:#1f3a5f}
+    a.fchip.on{background:#1f3a5f;color:#fff;border-color:#1f3a5f}
+    h3.who{margin:10px 0 10px;color:#1f3a5f}
     .bar-val{position:absolute;top:0;line-height:18px;font-size:12px;color:#1d2330;margin-left:6px;white-space:nowrap}
     .bar-row .tip{display:none;position:absolute;left:0;top:-30px;background:#1d2330;color:#fff;padding:4px 8px;border-radius:4px;font-size:12px;white-space:nowrap;z-index:2}
     .bar-row:hover .tip{display:block}
@@ -539,6 +832,11 @@ class Page:
     .banner a{color:#1f3a5f;font-weight:600}
     tr.pick{cursor:pointer}
     tr.pick.sel td{background:#fff3c4 !important}
+    .chips{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 10px}
+    .chips .lbl{font-size:13px;color:#5b6b7d;margin-right:2px}
+    button.chip.pick{cursor:pointer;background:#fff;color:#1f3a5f;border:1px solid #b8c2cf;border-radius:16px;padding:5px 12px;font-size:13px}
+    button.chip.pick:hover{border-color:#1f3a5f}
+    button.chip.pick.sel{background:#1f3a5f;color:#fff;border-color:#1f3a5f}
     """
 
     # Home page illustration: an airliner climbing away from an airport at sunset (drawn as animated SVG)
@@ -623,8 +921,10 @@ class Page:
   </g>
 </g>
 <g fill="#e9ecf7" opacity=".8"><animateTransform attributeName="transform" type="translate" from="1260 70" to="-60 92" dur="60s" begin="-25s" repeatCount="indefinite"/>
+  <g transform="scale(-1 1)">
   <path d="M0,4 L4,1 L26,1 Q31,2 32,4 Q31,6 26,6 L4,6 Z"/><path d="M3,3 L0,-3 L4,-3 L8,2 Z"/><path d="M14,4 L9,9 L13,9 L20,4 Z"/>
   <circle cx="32" cy="4" r="1.2" fill="#fff"><animate attributeName="opacity" values="1;0;0;1" dur="1.2s" repeatCount="indefinite"/></circle>
+  </g>
 </g>
 <g>
   <animateTransform attributeName="transform" type="translate" values="0 0; 4 -8; 0 0" dur="6s" repeatCount="indefinite"/>
@@ -732,7 +1032,7 @@ class Page:
   var D = JSON.parse(document.getElementById('globe-data').textContent);
   var el = document.getElementById('globe'), info = document.getElementById('globe-info');
   if (typeof Globe === 'undefined') {
-    el.innerHTML = "<div class='globe-msg'>The 3D globe needs an internet connection (it loads from cdn.jsdelivr.net).</div>";
+    el.innerHTML = "<div class='globe-msg'>The 3D globe could not load. It needs an internet connection (it loads from cdn.jsdelivr.net). Please refresh the page.</div>";
     return;
   }
   var R = Math.PI/180;
@@ -745,15 +1045,24 @@ class Page:
   var pairs = {};
   D.routes.forEach(function(r){
     var k = r[0] < r[1] ? r[0]+'|'+r[1] : r[1]+'|'+r[0];
-    var p = pairs[k] || (pairs[k] = {a:k.split('|')[0], b:k.split('|')[1], lines:{}, list:[]});
+    var ab = k.split('|');
+    if (D.focus && ab[1] === D.focus) ab.reverse();  // arcs flow outward from the focus airport
+    var p = pairs[k] || (pairs[k] = {a:ab[0], b:ab[1], lines:{}, list:[]});
     p.lines[r[2]] = 1; p.list.push(r);
   });
   var arcs = Object.keys(pairs).map(function(k){
     var p = pairs[k]; p.mi = miles(p.a, p.b); p.hl = false; return p;
   });
   function arcLabel(p){
-    return '<b>' + p.a + ' &#8644; ' + p.b + '</b><br>' + p.mi.toLocaleString() + ' miles<br>' +
-           Object.keys(p.lines).join(', ');
+    var A = D.airports[p.a], B = D.airports[p.b];
+    return '<b>' + p.a + ' &#8644; ' + p.b + '</b><br>' + A[3] + ' &#8594; ' + B[3] + '<br>' +
+           p.mi.toLocaleString() + ' miles<br>Airlines: ' + Object.keys(p.lines).join(', ');
+  }
+  function midpoint(a, b){
+    var p = D.airports[a], q = D.airports[b];
+    function v(l){ return [Math.cos(l[0]*R)*Math.cos(l[1]*R), Math.cos(l[0]*R)*Math.sin(l[1]*R), Math.sin(l[0]*R)]; }
+    var x = v(p), y = v(q), m = [x[0]+y[0], x[1]+y[1], x[2]+y[2]];
+    return {lat: Math.atan2(m[2], Math.sqrt(m[0]*m[0]+m[1]*m[1]))/R, lng: Math.atan2(m[1], m[0])/R};
   }
   var g = Globe()(el)
     .globeImageUrl('https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-blue-marble.jpg')
@@ -763,7 +1072,7 @@ class Page:
     .arcStartLat(function(p){return D.airports[p.a][0];}).arcStartLng(function(p){return D.airports[p.a][1];})
     .arcEndLat(function(p){return D.airports[p.b][0];}).arcEndLng(function(p){return D.airports[p.b][1];})
     .arcColor(function(p){return p.hl ? ['#ffd166','#ef476f'] : 'rgba(120,200,255,0.35)';})
-    .arcStroke(function(p){return p.hl ? 0.7 : 0.25;})
+    .arcStroke(function(p){return p.hl ? (sel && selKind === 'route' ? 1.1 : 0.7) : 0.25;})
     .arcDashLength(function(p){return p.hl ? 0.5 : 1;})
     .arcDashGap(function(p){return p.hl ? 0.15 : 0;})
     .arcDashAnimateTime(function(p){return p.hl ? 2000 : 0;})
@@ -774,19 +1083,35 @@ class Page:
     .pointAltitude(0.01)
     .pointLabel(function(c){var a = D.airports[c]; return '<b>' + c + '</b> ' + a[2] + '<br>' + a[3] + ', ' + a[4];});
   window.addEventListener('resize', function(){ g.width(el.clientWidth).height(el.clientHeight); });
+  function hideLoading(){ var l = document.getElementById('globe-loading'); if (l) l.remove(); }
+  if (g.onGlobeReady) g.onGlobeReady(hideLoading);
+  setTimeout(hideLoading, 9000);
 
-  var sel = null, hot = {};
+  var sel = null, selKind = null, hot = {};
   var marks = {}; (D.marks || []).concat(D.focus ? [D.focus] : []).forEach(function(c){ marks[c] = 1; });
   var base = null;  // optional: only these airports' arcs are shown when nothing is selected
   if (D.base) { base = {}; D.base.forEach(function(c){ base[c] = 1; }); }
   function inBase(p){ return !base || base[p.a] || base[p.b]; }
   var baseInfo = info.innerHTML;
-  if (D.labels) {
-    g.labelsData(D.labels)
-      .labelLat(function(l){return D.airports[l[0]][0];}).labelLng(function(l){return D.airports[l[0]][1];})
-      .labelText(function(l){return l[1];})
-      .labelColor(function(l){return marks[l[0]] ? '#ff8fa3' : '#ffd166';})
-      .labelSize(0.9).labelDotRadius(0.35).labelAltitude(0.012).labelResolution(2);
+  // airport name tags: real page elements, so they stay the same readable size at any zoom
+  function tag(l){
+    var wrap = document.createElement('div'), el = document.createElement('div');
+    el.className = 'gtag' + (marks[l[0]] || l[0] === sel ? ' mark' : '');
+    el.innerHTML = '<b>' + l[1] + '</b><span>' + (D.airports[l[0]] ? D.airports[l[0]][3] : '') + '</span>';
+    wrap.appendChild(el); return wrap;
+  }
+  function setTags(list){
+    if (!g.htmlElementsData) return;
+    g.htmlElementsData(list);
+  }
+  if (D.labels && g.htmlElementsData) {
+    g.htmlLat(function(l){return D.airports[l[0]][0];}).htmlLng(function(l){return D.airports[l[0]][1];})
+     .htmlAltitude(0.015).htmlElement(tag);
+    if (g.htmlTransitionDuration) g.htmlTransitionDuration(0);
+    if (g.htmlElementVisibilityModifier) {
+      g.htmlElementVisibilityModifier(function(el, visible){ el.style.opacity = visible ? 1 : 0; });
+    }
+    setTags(D.labels.slice());
   }
   function draw(){
     var on = arcs.filter(function(p){return p.hl;});
@@ -802,11 +1127,11 @@ class Page:
     var a = D.airports[code]; if (a) g.pointOfView({lat:a[0], lng:a[1], altitude:alt || 1.8}, 1200);
   }
   window.showOnGlobe = function(key, kind){
-    sel = key; hot = {};
+    sel = key; selKind = kind; hot = {};
     var count = 0;
     arcs.forEach(function(p){
       p.hl = key === null ? !!(base && inBase(p))
-           : kind === 'airport' ? (p.a === key || p.b === key) : !!p.lines[key];
+           : (kind === 'airport' || kind === 'route') ? (p.a === key || p.b === key) : !!p.lines[key];
       if (p.hl) {
         hot[p.a] = 1; hot[p.b] = 1;
         p.list.forEach(function(r){ if (kind !== 'airline' || r[2] === key) count++; });
@@ -821,8 +1146,22 @@ class Page:
     } else {
       info.innerHTML = '<b>' + key + '</b> ' + (D.airlines[key] || '') + ' &mdash; ' + count + ' routes';
     }
+    if (D.labels) {
+      if (key && (kind === 'route' || kind === 'airport')) {
+        // a single connection is selected: label only its end points and the selected airport
+        var keep = D.labels.filter(function(l){ return marks[l[0]]; });
+        setTags(keep.concat([[key, key]]));
+      } else {
+        setTags(D.labels.slice());
+      }
+    }
     draw();
-    if (key && kind === 'airport') fly(key, D.alt || 1.6);
+    if (key && kind === 'route' && D.focus) {
+      var on1 = arcs.filter(function(p){return p.hl;})[0], m = midpoint(D.focus, key);
+      var mi = on1 ? on1.mi : 1000;
+      g.pointOfView({lat: m.lat, lng: m.lng, altitude: Math.min(2.6, Math.max(0.9, 0.55 + mi/2600))}, 1300);
+    }
+    else if (key && kind === 'airport') fly(key, D.alt || 1.6);
     else if (D.focus) fly(D.focus, D.alt || 1.8);
   };
   window.showOnGlobe(null, null);
@@ -832,10 +1171,10 @@ class Page:
   g.controls().autoRotateSpeed = 0.4;
 
   // clickable table rows
-  document.querySelectorAll('tr.pick').forEach(function(tr){
+  document.querySelectorAll('.pick').forEach(function(tr){
     tr.addEventListener('click', function(){
       var was = tr.classList.contains('sel');
-      document.querySelectorAll('tr.pick.sel').forEach(function(x){ x.classList.remove('sel'); });
+      document.querySelectorAll('.pick.sel').forEach(function(x){ x.classList.remove('sel'); });
       g.controls().autoRotate = false;
       if (was) { window.showOnGlobe(null, null); return; }
       tr.classList.add('sel');
@@ -847,31 +1186,183 @@ class Page:
 })();
 """
 
-    NAV = [("/", "⌂ Home"),
-           ("/airline", "1.1 Airline Lookup"),
-           ("/airport", "1.2 Airport Lookup"),
-           ("/report/airline-airports", "2.1a Airline → Airports"),
-           ("/report/airport-airlines", "2.1b Airport → Airlines"),
-           ("/report/airlines", "2.2a All Airlines"),
-           ("/report/airports", "2.2b All Airports"),
-           ("/id", "2.3 Get ID"),
-           ("/onehop", "★ One Hop Routes"),
-           ("/charts", "Charts"),
-           ("/edit", "Edit Data"),
-           ("/code", "OO Code"),
-           ("/about", "About"),
-           ("/contact", "Contact")]
-    NAV_SECONDARY = ("/code", "/about", "/contact")
+    # Line icons (24x24, drawn with the text colour) used by the menu and the home page
+    ICONS = {
+        "home": '<path d="M3 11l9-7 9 7"/><path d="M5 9.5V20h5v-6h4v6h5V9.5"/>',
+        "plane": '<path d="M21 15.5v-2l-8-5V3.8a1.5 1.5 0 0 0-3 0v4.7l-8 5v2l8-2.5v5l-2 1.5V21l3.5-1 3.5 1v-1.5l-2-1.5v-5z"/>',
+        "tower": '<path d="M6 10h12l-1.6-4H7.6z"/><path d="M8 6V4h8v2"/><path d="M12 4V2"/><path d="M9 10v11M15 10v11"/><path d="M5 21h14"/>',
+        "route": '<circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/><path d="M8 19h7.5a3.5 3.5 0 0 0 0-7h-7a3.5 3.5 0 0 1 0-7H16"/>',
+        "data": '<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>',
+        "info": '<circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><path d="M12 7.5h.01"/>',
+        "mail": '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3.5 7l8.5 6 8.5-6"/>',
+        "search": '<circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/>',
+        "list": '<path d="M9 6h11M9 12h11M9 18h11"/><path d="M4.5 6h.01M4.5 12h.01M4.5 18h.01"/>',
+        "network": '<circle cx="12" cy="12" r="2.5"/><circle cx="4.5" cy="5" r="2"/><circle cx="19.5" cy="5" r="2"/><circle cx="4.5" cy="19" r="2"/><circle cx="19.5" cy="19" r="2"/><path d="M6 6.4l4.2 4M18 6.4l-4.2 4M6 17.6l4.2-4M18 17.6l-4.2-4"/>',
+        "pin": '<path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z"/><circle cx="12" cy="10" r="2.3"/>',
+        "hop": '<circle cx="4" cy="18" r="2"/><circle cx="12" cy="8" r="2"/><circle cx="20" cy="18" r="2"/><path d="M5.3 16.4l5.4-6.8M13.3 9.6l5.4 6.8"/>',
+        "idcard": '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2"/><path d="M5.8 16c.6-1.4 1.8-2 3.2-2s2.6.6 3.2 2"/><path d="M15 10h3.5M15 14h3.5"/>',
+        "pencil": '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>',
+        "chart": '<path d="M4 20h16"/><path d="M7 16v-5M12 16V6M17 16v-8"/>',
+        "code": '<path d="M8 8l-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/>',
+        "user": '<circle cx="12" cy="8" r="4"/><path d="M4 21c1-4 4.4-6 8-6s7 2 8 6"/>',
+        "chev": '<path d="M6 9l6 6 6-6"/>',
+        "menu": '<path d="M4 6h16M4 12h16M4 18h16"/>',
+    }
+
+    # (icon, label, url or None, [(url, icon, title, assignment tag, description)], right-aligned)
+    NAV_GROUPS = [
+        ("home", "Home", "/", [], False),
+        ("plane", "Airlines", None, [
+            ("/airline", "search", "Airline Lookup", "1.1", "Find one airline by its IATA code"),
+            ("/report/airlines", "list", "All Airlines", "2.2a", "Every airline, sorted and searchable")], False),
+        ("tower", "Airports", None, [
+            ("/airport", "search", "Airport Lookup", "1.2", "Airport details and its routes on the globe"),
+            ("/report/airports", "list", "All Airports", "2.2b", "Filter by city, country or airline")], False),
+        ("route", "Routes", None, [
+            ("/report/airline-airports", "network", "Airline → Airports", "2.1a", "Airports an airline serves, by # routes"),
+            ("/report/airport-airlines", "pin", "Airport → Airlines", "2.1b", "Airlines at an airport, by # routes"),
+            ("/onehop", "hop", "One Hop Routes", "★", "One-stop trips ranked by air miles")], False),
+        ("data", "Data Management", None, [
+            ("/id", "idcard", "Get ID", "2.3", "Site owner name and student ID"),
+            ("/edit", "pencil", "Edit Data", "", "Changes stay in your browser session only"),
+            ("/charts", "chart", "Charts & Statistics", "", "Interactive charts, filter by airline")], False),
+        ("info", "About", None, [
+            ("/about", "user", "About", "", "The developer and this project"),
+            ("/code", "code", "Technical Overview", "", "Classes and the full OO source code")], True),
+        ("mail", "Contact", "/contact", [], False),
+    ]
+    NAV = [(u, t) for _, t, u, _, _ in NAV_GROUPS if u] + \
+          [(u, title) for _, _, _, subs, _ in NAV_GROUPS for u, _, title, _, _ in subs]
+
+    @classmethod
+    def icon(cls, name, extra=""):
+        return (f"<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8' "
+                f"stroke-linecap='round' stroke-linejoin='round' aria-hidden='true'{extra}>{cls.ICONS[name]}</svg>")
+
+    @classmethod
+    def sub_link(cls, url, ic, title, tag, desc, css="sub-link"):
+        tag_html = f"<em>{html.escape(tag)}</em>" if tag else ""
+        return (f"<a class='{css}' href='{url}'><span class='ic'>{cls.icon(ic)}</span>"
+                f"<span class='txt'><b>{html.escape(title)}{tag_html}</b><small>{html.escape(desc)}</small></span></a>")
+
+    @classmethod
+    def menu(cls):
+        items = ""
+        chev = cls.icon("chev", " class='chev'")
+        for ic, label, url, subs, right in cls.NAV_GROUPS:
+            r = " right" if right else ""
+            if url:
+                items += (f"<li class='nav-item{r}'><a class='nav-top' href='{url}'>{cls.icon(ic)}"
+                          f"<span>{html.escape(label)}</span></a></li>")
+            else:
+                links = "".join(cls.sub_link(*s) for s in subs)
+                items += (f"<li class='nav-item has-sub{r}'><button type='button' class='nav-top' aria-expanded='false'>"
+                          f"{cls.icon(ic)}<span>{html.escape(label)}</span>{chev}</button>"
+                          f"<div class='sub'>{links}</div></li>")
+        return (f"<nav class='mainnav' aria-label='Main menu'><button type='button' class='nav-toggle' aria-expanded='false'>"
+                f"{cls.icon('menu')}<span>Menu</span></button><ul class='nav-list'>{items}</ul></nav>")
+
+    AC_JS = r"""
+(function(){
+  var inputs = document.querySelectorAll('input.ac'); if (!inputs.length) return;
+  var data = null, loading = null;
+  function load(){ if (!loading) loading = fetch('/api/lookup.json').then(function(r){ return r.json(); }).then(function(d){ data = d; }); return loading; }
+  function norm(s){ return (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase(); }
+  function score(kind, row, q){
+    if (kind === 'airport') {
+      var c = norm(row[0]), city = norm(row[2]), name = norm(row[1]), cty = norm(row[3]);
+      if (c === q) return 0; if (city === q) return 1; if (city.indexOf(q) === 0) return 2; if (c.indexOf(q) === 0) return 3;
+      if ((' ' + name).indexOf(' ' + q) !== -1) return 4; if (city.indexOf(q) !== -1 || name.indexOf(q) !== -1) return 5;
+      if (cty.indexOf(q) === 0) return 6; return -1;
+    }
+    var c2 = norm(row[0]), n = norm(row[1]), ct = norm(row[2]);
+    if (c2 === q) return 0; if (n.indexOf(q) === 0) return 1; if ((' ' + n).indexOf(' ' + q) !== -1) return 2;
+    if (n.indexOf(q) !== -1) return 3; if (ct.indexOf(q) === 0) return 4; return -1;
+  }
+  inputs.forEach(function(inp){
+    var kind = inp.dataset.ac, list = document.createElement('ul'), items = [], on = -1;
+    list.className = 'ac-list'; list.setAttribute('role', 'listbox'); inp.parentNode.appendChild(list);
+    function close(){ list.classList.remove('show'); on = -1; }
+    function choose(i){ var r = items[i]; if (!r) return; inp.value = r[0]; close();
+      if (inp.dataset.submit && inp.form) inp.form.submit(); }
+    function render(){
+      var q = norm(inp.value.trim()); if (!q || !data) { close(); return; }
+      var rows = data[kind === 'airport' ? 'airports' : 'airlines'], hits = [];
+      rows.forEach(function(r){ var s = score(kind, r, q); if (s >= 0) hits.push([s, r]); });
+      hits.sort(function(a, b){ return a[0] - b[0] || (a[1][2] || '').localeCompare(b[1][2] || ''); });
+      items = hits.slice(0, 8).map(function(h){ return h[1]; }); on = -1;
+      if (!items.length) { list.innerHTML = "<li style='cursor:default'><span>No matches</span></li>"; items = []; list.classList.add('show'); return; }
+      list.innerHTML = items.map(function(r, i){
+        var main = kind === 'airport' ? r[2] + ' &middot; ' + r[1] : r[1];
+        var right = kind === 'airport' ? r[3] : r[2];
+        return "<li role='option' data-i='" + i + "'><b>" + r[0] + "</b><span>" + main.replace(/</g, '&lt;') + "</span><small>" + right + "</small></li>";
+      }).join('');
+      list.classList.add('show');
+    }
+    function mark(){ [].forEach.call(list.children, function(li, i){ li.classList.toggle('on', i === on); }); }
+    inp.addEventListener('focus', function(){ load().then(render); });
+    inp.addEventListener('input', function(){ load().then(render); });
+    inp.addEventListener('keydown', function(e){
+      if (!list.classList.contains('show') || !items.length) return;
+      if (e.key === 'ArrowDown') { on = Math.min(items.length - 1, on + 1); mark(); e.preventDefault(); }
+      else if (e.key === 'ArrowUp') { on = Math.max(0, on - 1); mark(); e.preventDefault(); }
+      else if (e.key === 'Enter') { if (on < 0 && items.length) on = 0; e.preventDefault(); choose(on); }
+      else if (e.key === 'Escape') close();
+    });
+    list.addEventListener('mousedown', function(e){ var li = e.target.closest('li[data-i]'); if (li) { e.preventDefault(); choose(+li.dataset.i); } });
+    inp.addEventListener('blur', function(){ setTimeout(close, 120); });
+  });
+})();
+"""
+
+    LOCALTIME_JS = r"""
+(function(){
+  var els = document.querySelectorAll('.localtime'); if (!els.length) return;
+  function tick(){
+    els.forEach(function(el){
+      var now = new Date(), txt = '';
+      try { if (el.dataset.tz) txt = now.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit', timeZone: el.dataset.tz}); } catch (e) {}
+      if (!txt && el.dataset.offset) {
+        var t = new Date(now.getTime() + parseFloat(el.dataset.offset) * 3600000);
+        txt = t.toISOString().substr(11, 5) + ' (UTC' + (parseFloat(el.dataset.offset) >= 0 ? '+' : '') + el.dataset.offset + ')';
+      }
+      el.textContent = txt || '\u2014';
+    });
+  }
+  tick(); setInterval(tick, 30000);
+})();
+"""
+
+    MENU_JS = r"""
+(function(){
+  var nav = document.querySelector('nav.mainnav'); if (!nav) return;
+  var p = location.pathname.replace(/\/$/, '') || '/';
+  nav.querySelectorAll('a').forEach(function(a){
+    if (a.getAttribute('href') === p) { a.classList.add('active'); a.closest('.nav-item').classList.add('active'); }
+  });
+  function closeAll(except){ nav.querySelectorAll('.has-sub.open').forEach(function(li){
+    if (li !== except) { li.classList.remove('open'); li.querySelector('.nav-top').setAttribute('aria-expanded', 'false'); } }); }
+  nav.querySelectorAll('.has-sub > .nav-top').forEach(function(b){
+    b.addEventListener('click', function(e){
+      var li = b.parentNode, open = !li.classList.contains('open');
+      closeAll(li); li.classList.toggle('open', open); b.setAttribute('aria-expanded', open ? 'true' : 'false');
+      e.stopPropagation();
+    });
+  });
+  document.addEventListener('click', function(e){ if (!nav.contains(e.target)) closeAll(null); });
+  document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closeAll(null); });
+  var tog = nav.querySelector('.nav-toggle');
+  tog.addEventListener('click', function(){
+    var open = !nav.classList.contains('open'); nav.classList.toggle('open', open);
+    tog.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+})();
+"""
 
     @classmethod
     def render(cls, title, body, globe_data=None, extra_js="", banner="", extra_head=""):
-        link = lambda u, t: "<a href='%s'>%s</a>" % (u, html.escape(t))
-        nav = ("".join(link(u, t) for u, t in cls.NAV if u not in cls.NAV_SECONDARY)
-               + "<span class='nav2'>" + "".join(link(u, t) for u, t in cls.NAV if u in cls.NAV_SECONDARY)
-               + "</span>")
-        scripts = ("<script>(function(){var p=location.pathname.replace(/\\/$/,'')||'/';"
-                   "document.querySelectorAll('nav a').forEach(function(a){"
-                   "if(a.getAttribute('href')===p)a.classList.add('active');});})();</script>")
+        nav = cls.menu()
+        scripts = f"<script>{cls.MENU_JS}</script><script>{cls.AC_JS}</script><script>{cls.LOCALTIME_JS}</script>"
         if extra_js:
             scripts += f"<script>{extra_js}</script>"
         if globe_data is not None:
@@ -883,21 +1374,121 @@ class Page:
                 f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
                 f"<title>{html.escape(title)} - Airline Route Access</title>"
                 f"<style>{cls.CSS}</style>{extra_head}</head><body>"
-                f"<header><a href='/'>✈ Airline Route Access</a></header>"
-                f"<nav>{nav}</nav>{banner}<main>{body}</main>{scripts}</body></html>")
+                f"<header class='topbar'><div class='topbar-in'><a class='brand' href='/'>{cls.icon('plane')}"
+                f"<span>Airline Route Access</span></a>{nav}</div></header>"
+                f"{banner}<main>{body}</main>{cls.footer()}{scripts}</body></html>")
 
     @staticmethod
     def globe(caption, hint=""):
         hint_html = f"<p class='hint'>{html.escape(hint)}</p>" if hint else ""
-        return (f"<div class='globe-wrap'><div id='globe'></div>"
+        return (f"<div class='globe-wrap'><div id='globe'><div class='globe-loading' id='globe-loading'>"
+                f"<span class='spin'></span>Loading 3D globe&hellip;</div></div>"
                 f"<div class='globe-info' id='globe-info'>{caption}</div></div>{hint_html}")
 
     @staticmethod
-    def form(action, label, value=""):
-        return (f"<form action='{action}' method='get'>"
-                f"<label>{html.escape(label)}: "
-                f"<input type='text' name='code' value='{html.escape(value)}' autofocus></label> "
-                f"<button type='submit'>Go</button></form>")
+    def ac_input(name, kind, value="", autofocus=False, submit=False):
+        """A search box that suggests airports/airlines as you type (city, name or code)."""
+        ph = "City, airport or code (e.g. San Jose or SJC)" if kind == "airport" else "Airline name or code (e.g. Delta or DL)"
+        return (f"<span class='ac-wrap'><input type='text' class='ac' name='{name}' data-ac='{kind}'"
+                f"{' data-submit=1' if submit else ''} value='{html.escape(value)}' placeholder='{ph}' "
+                f"autocomplete='off' spellcheck='false'{' autofocus' if autofocus else ''}></span>")
+
+    @classmethod
+    def form(cls, action, label, value="", kind="airport"):
+        return (f"<form class='lookup-form' action='{action}' method='get'><label>{html.escape(label)}"
+                f"{cls.ac_input('code', kind, value, autofocus=not value, submit=True)}</label>"
+                f"<button type='submit'>Search</button></form>")
+
+    @staticmethod
+    def examples(items, label="Examples:"):
+        return ("<div class='examples'><span>" + html.escape(label) + "</span>"
+                + "".join(f"<a href='{html.escape(u)}'>{html.escape(t)}</a>" for t, u in items) + "</div>")
+
+    @classmethod
+    def not_found(cls, what, q, suggestions, url_for):
+        """Error box; when the text matched several things, offer them as links."""
+        if suggestions:
+            return ("<div class='suggest'><p>More than one " + what + " matches <b>" + html.escape(q)
+                    + "</b>. Did you mean:</p>"
+                    + cls.examples([(f"{s.iata} · {getattr(s, 'city', '') or s.name}", url_for(s)) for s in suggestions], "")
+                    + "</div>")
+        return cls.error(f"No {what} found for '{q}'. Try a city, a name, or a code.")
+
+    DST_MEANING = {"E": "Europe", "A": "US / Canada", "S": "South America", "O": "Australia",
+                   "Z": "New Zealand", "N": "None", "U": "Unknown"}
+
+    @classmethod
+    def airport_card(cls, a, stats=()):
+        """Readable card that still shows every field of the airport record."""
+        def fact(k, v, css="fact"):
+            return f"<div class='{css}'><span class='k'>{html.escape(k)}</span><span class='v'>{v}</span></div>"
+        esc = lambda v: html.escape(v) if v else "&mdash;"
+        off = a.utc_offset
+        offs = ("UTC" + ("+" if off and not off.startswith("-") else "") + off) if off else "&mdash;"
+        dst = esc(a.dst) + (f" <small>({cls.DST_MEANING[a.dst]})</small>" if a.dst in cls.DST_MEANING else "")
+        tz_attr = f" data-tz='{html.escape(a.timezone)}'" if a.timezone else ""
+        facts = (fact("IATA", esc(a.iata)) + fact("ICAO", esc(a.icao)) + fact("OpenFlights ID", esc(a.id))
+                 + fact("City", esc(a.city)) + fact("Country", esc(a.country))
+                 + fact("Latitude", esc(a.latitude)) + fact("Longitude", esc(a.longitude))
+                 + fact("Altitude", (esc(a.altitude) + " <small>ft</small>") if a.altitude else "&mdash;")
+                 + fact("UTC offset", offs) + fact("DST", dst) + fact("Timezone", esc(a.timezone.replace("_", " ")))
+                 + fact("Type", esc(a.type)) + fact("Source", esc(a.source))
+                 + "".join(fact(k, v, "fact stat") for k, v in stats))
+        return ("<div class='info-card'><div class='ic-head'>"
+                f"<div class='code-badge'>{html.escape(a.iata)}</div><div><h2>{html.escape(a.name)}</h2>"
+                f"<p>{html.escape(a.city)}, {html.escape(a.country)} &middot; Local time "
+                f"<span class='localtime'{tz_attr} data-offset='{html.escape(off)}'>&mdash;</span></p></div></div>"
+                f"<div class='facts'>{facts}</div>"
+                f"<details class='raw'><summary>Show the full record as a table</summary>"
+                f"{cls.entity(Airport.FIELDS, a.values())}</details></div>")
+
+    @classmethod
+    def airline_card(cls, a, stats=()):
+        def fact(k, v, css="fact"):
+            return f"<div class='{css}'><span class='k'>{html.escape(k)}</span><span class='v'>{v}</span></div>"
+        esc = lambda v: html.escape(v) if v else "&mdash;"
+        active = a.active.upper() == "Y"
+        pill = f"<span class='pill {'on' if active else 'off'}'>{'Active' if active else 'Inactive'}</span>"
+        facts = (fact("IATA", esc(a.iata)) + fact("ICAO", esc(a.icao)) + fact("OpenFlights ID", esc(a.id))
+                 + fact("Callsign", esc(a.callsign)) + fact("Alias", esc(a.alias)) + fact("Country", esc(a.country))
+                 + fact("Active", "Yes" if active else "No")
+                 + "".join(fact(k, v, "fact stat") for k, v in stats))
+        return ("<div class='info-card'><div class='ic-head'>"
+                f"<div class='code-badge'>{html.escape(a.iata)}</div><div><h2>{html.escape(a.name)}{pill}</h2>"
+                f"<p>{html.escape(a.country)}</p></div></div><div class='facts'>{facts}</div>"
+                f"<details class='raw'><summary>Show the full record as a table</summary>"
+                f"{cls.entity(Airline.FIELDS, a.values())}</details></div>")
+
+    @classmethod
+    def page_head(cls, path):
+        for ic, label, url, subs, _ in cls.NAV_GROUPS:
+            if url == path:
+                desc = {"/contact": "Get in touch or connect on LinkedIn"}.get(path, "")
+                return cls._head(ic, label, "", desc)
+            for u, sic, title, tag, desc in subs:
+                if u == path:
+                    return cls._head(sic, title, tag, desc)
+        return ""
+
+    @classmethod
+    def _head(cls, ic, title, tag, desc):
+        tag_html = f"<em>{html.escape(tag)}</em>" if tag else ""
+        desc_html = f"<p>{html.escape(desc)}</p>" if desc else ""
+        return (f"<div class='page-head'><span class='ic'>{cls.icon(ic)}</span><div>"
+                f"<h1>{html.escape(title)}{tag_html}</h1>{desc_html}</div></div>")
+
+    @classmethod
+    def footer(cls):
+        gh = f"<a href='{GITHUB_URL}' target='_blank' rel='noopener'>Source code on GitHub</a><br>" if GITHUB_URL else ""
+        return ("<footer class='site-foot'><div class='foot-in'>"
+                f"<div><a class='brand' href='/'>{cls.icon('plane')}<span>Airline Route Access</span></a>"
+                "Explore airlines, airports and routes, plan one-stop trips, and see every route on an "
+                "interactive 3D globe.</div>"
+                f"<div><h4>Built by</h4>{html.escape(STUDENT_NAME)}<br>CIS 51 &middot; De Anza College<br>"
+                f"<a href='{LINKEDIN_URL}' target='_blank' rel='noopener'>LinkedIn</a></div>"
+                f"<div><h4>Project</h4><a href='/about'>About</a><br><a href='/code'>Technical overview</a><br>{gh}"
+                "<a href='https://openflights.org/data' target='_blank' rel='noopener'>Data: OpenFlights</a></div>"
+                "</div><div class='foot-bottom'>Built with Vibe Coding &middot; Python &amp; globe.gl &middot; 2026</div></footer>")
 
     @staticmethod
     def table(headers, rows, keys=None, kind=None, infos=None, row_data=None):
@@ -914,8 +1505,9 @@ class Page:
             elif row_data:
                 attr = " class='frow'" + "".join(f" data-{k}='{html.escape(str(v))}'"
                                                  for k, v in row_data[i].items())
-            body += f"<tr{attr}>" + "".join(f"<td>{html.escape(str(v))}</td>" for v in r) + "</tr>"
-        return f"<div class='scroll'><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
+            body += f"<tr{attr}>" + "".join(f"<td data-label='{html.escape(headers[j])}'>{html.escape(str(v))}</td>"
+                                            for j, v in enumerate(r)) + "</tr>"
+        return f"<div class='scroll'><table class='rt'><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
 
     @staticmethod
     def entity(fields, values):
@@ -933,11 +1525,12 @@ class Page:
 # ---------------------------------------------------------------------------
 class AviationWebApp:
     """Maps each URL to a page and builds that page from the database."""
-    QUERY_HANDLERS = ("/onehop", "/edit")  # these receive the whole query string
+    QUERY_HANDLERS = ("/onehop", "/edit", "/charts")  # these receive the whole query string
 
     def __init__(self, db, in_session=False):
         self.db = db
         self.in_session = in_session
+        self.path = "/"
         self.routes = {
             "/": self.home,
             "/airline": self.airline_lookup,
@@ -962,58 +1555,116 @@ class AviationWebApp:
             n = len(self.db.edits)
             banner = (f"<div class='banner'>✎ You are viewing data with {n} change{'s' if n != 1 else ''} "
                       f"made in this browser session only. <a href='/edit'>See or reset changes</a></div>")
+        head = Page.page_head(self.path) if self.path != "/" else ""
+        if head:
+            if body.startswith("<h2>"):
+                body = head + body[body.index("</h2>") + 5:]
+            else:
+                body = head + body
         return Page.render(title, body, globe_data, extra_js, banner, extra_head)
 
     def handle(self, path, query):
+        self.path = path
         handler = self.routes.get(path)
         if handler is None:
             return 404, self.render("Not found", Page.error("Page not found."))
         if path in self.QUERY_HANDLERS:
             return 200, handler(query)
-        code = query.get("code", [""])[0].strip().upper()
+        code = query.get("code", [""])[0].strip()[:60]
         return 200, handler(code)
 
     def home(self, _):
-        cards = "".join(f"<div class='card'><a href='{u}'>{html.escape(t)}</a></div>"
-                        for u, t in Page.NAV if u != "/")
+        cards = ""
+        for ic, label, url, subs, _ in Page.NAV_GROUPS:
+            if not subs:
+                continue
+            if label == "About":
+                subs = subs + [("/contact", "mail", "Contact", "", "Get in touch or connect on LinkedIn")]
+            cards += (f"<section class='home-group'><h2>{Page.icon(ic)}{html.escape(label)}</h2><div class='home-cards'>"
+                      + "".join(Page.sub_link(*s, css="sub-link home-card") for s in subs) + "</div></section>")
         art = ("<div class='hero-photo'><img src='/hero' alt='Airplane at an airport'></div>"
                if find_hero() else Page.HERO_SVG)
         hero = (f"<div class='hero{' has-photo' if find_hero() else ''}'>{art}<div class='hero-text'>"
                 f"<h1>Air Travel Database</h1>"
                 f"<p>{len(self.db.airlines_by_iata)} airlines · {len(self.db.airports_by_iata)} airports · "
                 f"{len(self.db.routes):,} routes</p></div></div>")
-        return self.render("Home", f"{hero}<div class='cards'>{cards}</div>")
+        return self.render("Home", f"{hero}{cards}")
+
+    def airline_buttons(self, url):
+        """One button per airline (there are only a few), labelled with code and short name."""
+        short = lambda n: n.replace(" Air Lines", "").replace(" Airlines", "").replace(" Airways", "").strip() or n
+        return Page.examples([(f"{a.iata} {short(a.name)}", f"{url}?code={a.iata}") for a in self.db.all_airlines()],
+                             "Airlines:")
+    AIRPORT_EXAMPLES = [("SJC San Jose", "SJC"), ("SFO San Francisco", "SFO"), ("LAX Los Angeles", "LAX"),
+                        ("DEN Denver", "DEN"), ("ORD Chicago", "ORD"), ("ATL Atlanta", "ATL"),
+                        ("JFK New York", "JFK"), ("LHR London", "LHR")]
+
+    def airport_buttons(self, url):
+        return Page.examples([(t, f"{url}?code={c}") for t, c in self.AIRPORT_EXAMPLES], "Popular airports:")
 
     def airline_lookup(self, code):
-        body = "<h2>1.1 Airline Lookup</h2>" + Page.form("/airline", "Airline IATA code", code)
-        if code:
-            a = self.db.get_airline(code)
-            body += Page.entity(Airline.FIELDS, a.values()) if a else Page.error(f"No airline with IATA code '{code}'.")
+        a, sugg = self.db.resolve_airline(code) if code else (None, [])
+        body = "<h2>1.1 Airline Lookup</h2>" + Page.form("/airline", "Airline", a.iata if a else code, "airline")
+        if not code:
+            body += self.airline_buttons("/airline")
+        elif not a:
+            body += Page.not_found("airline", code, sugg, lambda s: f"/airline?code={s.iata}")
+        else:
+            routes = self.db.routes_of_airline(a)
+            n_airports = len(self.db.airports_for_airline(a))
+            body += Page.airline_card(a, [("Routes", f"{len(routes):,}"), ("Airports served", f"{n_airports:,}")])
+            body += (f"<p class='hint'>See this airline's network: <a href='/report/airline-airports?code={a.iata}'>"
+                     f"{html.escape(a.iata)} airports on the globe &rarr;</a></p>")
         return self.render("Airline Lookup", body)
 
     def airport_lookup(self, code):
-        body = "<h2>1.2 Airport Lookup</h2>" + Page.form("/airport", "Airport IATA code", code)
+        a, sugg = self.db.resolve_airport(code) if code else (None, [])
+        body = "<h2>1.2 Airport Lookup</h2>" + Page.form("/airport", "Airport", a.iata if a else code)
         globe = None
+        if not code:
+            body += self.airport_buttons("/airport")
         if code:
-            a = self.db.get_airport(code)
             if not a:
-                body += Page.error(f"No airport with IATA code '{code}'.")
+                body += Page.not_found("airport", code, sugg, lambda s: f"/airport?code={s.iata}")
             else:
                 routes = self.db.routes_at_airport(a)
-                body += (Page.globe(f"<b>{html.escape(a.iata)}</b> {html.escape(a.name)} &mdash; "
-                                    f"{len(routes)} routes (all airlines)")
-                         + Page.entity(Airport.FIELDS, a.values()))
+                dests = self.db.destinations(a)
+                per_airline = Counter(self.db.airlines_by_id[r.airline_id].iata for r in routes
+                                      if r.airline_id in self.db.airlines_by_id)
+                chips = ("<div class='chips'><span class='lbl'>Show only:</span>"
+                         + "".join(f"<button type='button' class='chip pick' data-key='{html.escape(c)}' data-kind='airline'>"
+                                   f"{html.escape(c)} &middot; {n}</button>" for c, n in per_airline.most_common())
+                         + "</div>")
+                body += (Page.airport_card(a, [("Routes", f"{len(routes):,}"), ("Destinations", f"{len(dests):,}"),
+                                               ("Airlines", f"{len(per_airline):,}")])
+                         + Page.globe(f"<b>{html.escape(a.iata)}</b> {html.escape(a.name)} &mdash; "
+                                      f"{len(routes)} routes to {len(dests)} airports",
+                                      "Click an airline to show only its routes, or a destination row below to show "
+                                      "that single route (click again to show all). Hover an arc for details.")
+                         + chips
+                         + f"<h3>Destinations ({len(dests)})</h3>"
+                         + Page.table(["IATA", "Airport", "City", "Country", "Air miles", "# Routes", "Airlines", "Direction"],
+                                      [[d["airport"].iata, d["airport"].name, d["airport"].city, d["airport"].country,
+                                        f"{d['miles']:,.0f}", d["count"], ", ".join(d["airlines"]), d["direction"]]
+                                       for d in dests],
+                                      keys=[d["airport"].iata for d in dests], kind="route",
+                                      infos=[f"{a.iata} ⇄ {d['airport'].iata} ({d['airport'].city}) · {d['miles']:,.0f} mi · "
+                                             f"{d['count']} route{'s' if d['count'] != 1 else ''} · {', '.join(d['airlines'])}"
+                                             for d in dests]))
                 globe = self.db.map_data(routes, focus=a.iata)
+                globe["labels"] = [[a.iata, a.iata]]
         return self.render("Airport Lookup", body, globe)
 
     def airline_airports_report(self, code):
+        airline, sugg = self.db.resolve_airline(code) if code else (None, [])
         body = ("<h2>2.1a Airports served by an Airline (by # routes)</h2>"
-                + Page.form("/report/airline-airports", "Airline IATA code", code))
+                + Page.form("/report/airline-airports", "Airline", airline.iata if airline else code, "airline"))
         globe = None
+        if not code:
+            body += self.airline_buttons("/report/airline-airports")
         if code:
-            airline = self.db.get_airline(code)
             if not airline:
-                body += Page.error(f"No airline with IATA code '{code}'.")
+                body += Page.not_found("airline", code, sugg, lambda s: f"/report/airline-airports?code={s.iata}")
             else:
                 rows = self.db.airports_for_airline(airline)
                 routes = self.db.routes_of_airline(airline)
@@ -1030,13 +1681,15 @@ class AviationWebApp:
         return self.render("Airline → Airports", body, globe)
 
     def airport_airlines_report(self, code):
+        airport, sugg = self.db.resolve_airport(code) if code else (None, [])
         body = ("<h2>2.1b Airlines serving an Airport (by # routes)</h2>"
-                + Page.form("/report/airport-airlines", "Airport IATA code", code))
+                + Page.form("/report/airport-airlines", "Airport", airport.iata if airport else code))
         globe = None
+        if not code:
+            body += self.airport_buttons("/report/airport-airlines")
         if code:
-            airport = self.db.get_airport(code)
             if not airport:
-                body += Page.error(f"No airport with IATA code '{code}'.")
+                body += Page.not_found("airport", code, sugg, lambda s: f"/report/airport-airlines?code={s.iata}")
             else:
                 rows = self.db.airlines_for_airport(airport)
                 routes = self.db.routes_at_airport(airport)
@@ -1077,8 +1730,10 @@ class AviationWebApp:
         return self.render("All Airports", body, extra_js=Page.FILTER_JS)
 
     def one_hop(self, query):
-        src = query.get("from", [""])[0].strip().upper()
-        dst = query.get("to", [""])[0].strip().upper()
+        src = query.get("from", [""])[0].strip()[:60]
+        dst = query.get("to", [""])[0].strip()[:60]
+        S, s_sugg = self.db.resolve_airport(src) if src else (None, [])
+        D, d_sugg = self.db.resolve_airport(dst) if dst else (None, [])
         flt = query.get("airline", ["ANY"])[0].strip().upper() or "ANY"
 
         opts = [("ANY", "Any airlines (mix allowed)"), ("SAME", "Same airline for both flights")]
@@ -1090,22 +1745,24 @@ class AviationWebApp:
         body = ("<h2>One Hop Routes</h2>"
                 "<p class='hint'>Trips from S to D with exactly one stop at X (S&rarr;X, then X&rarr;D). "
                 "Both flights must be non-stop. Ordered by total air miles (from GPS).</p>"
-                "<form class='onehop-form' action='/onehop' method='get'>"
-                f"<label>From: <input type='text' name='from' value='{html.escape(src)}' autofocus></label>"
-                f"<label>To: <input type='text' name='to' value='{html.escape(dst)}'></label>"
-                f"<label>Airline: <select name='airline'>{options}</select></label>"
+                "<form class='lookup-form' action='/onehop' method='get'>"
+                f"<label>From{Page.ac_input('from', 'airport', S.iata if S else src, autofocus=not src)}</label>"
+                f"<label>To{Page.ac_input('to', 'airport', D.iata if D else dst)}</label>"
+                f"<label>Airline<select name='airline'>{options}</select></label>"
                 "<button type='submit'>Find routes</button></form>")
         globe = None
         if not (src or dst):
+            body += Page.examples([(f"{a} → {b}", f"/onehop?from={a}&to={b}") for a, b in
+                                   [("SJC", "BOS"), ("SFO", "NRT"), ("LAX", "SYD"), ("SJC", "DXB"), ("SFO", "CDG")]])
             return self.render("One Hop", body)
 
-        S, D = self.db.get_airport(src), self.db.get_airport(dst)
         if not src or not dst:
-            return self.render("One Hop", body + Page.error("Please enter both a From and a To airport code."))
+            return self.render("One Hop", body + Page.error("Please enter both a From and a To airport."))
+        keep = lambda **kw: "/onehop?" + urlencode({"from": kw.get("f", src), "to": kw.get("t", dst), "airline": flt})
         if not S:
-            return self.render("One Hop", body + Page.error(f"No airport with IATA code '{src}'."))
+            return self.render("One Hop", body + Page.not_found("airport", src, s_sugg, lambda s: keep(f=s.iata)))
         if not D:
-            return self.render("One Hop", body + Page.error(f"No airport with IATA code '{dst}'."))
+            return self.render("One Hop", body + Page.not_found("airport", dst, d_sugg, lambda s: keep(t=s.iata)))
         if S is D:
             return self.render("One Hop", body + Page.error("From and To must be different airports."))
 
@@ -1139,9 +1796,29 @@ class AviationWebApp:
         globe.update(marks=[S.iata, D.iata], base=[e["via"].iata for e in top5], alt=2.0,
                      labels=[[S.iata, S.iata], [D.iata, D.iata]] +
                             [[e["via"].iata, f"{i + 1}. {e['via'].iata}"] for i, e in enumerate(top5)])
+        ranks = [("Shortest", "best"), ("2nd shortest", ""), ("3rd shortest", "")]
+        cards = ""
+        for (rank, css), p in zip(ranks, pairs[:3]):
+            via = p["via"]
+            info = (f"{S.iata} → {via.iata} ({p['airline1'].iata}) → {D.iata} ({p['airline2'].iata}): "
+                    f"{p['total']:,.0f} mi")
+            cards += (f"<button type='button' class='trip pick' data-key='{html.escape(via.iata)}' data-kind='airport' "
+                      f"data-info='{html.escape(info)}'><div class='trip-top'><span class='trip-rank {css}'>{rank}</span>"
+                      f"<span class='trip-total'>{p['total']:,.0f} mi<small>+{p['total'] - direct_mi:,.0f} mi vs straight line</small></span></div>"
+                      f"<div class='trip-path'>"
+                      f"<span class='stop'><b>{html.escape(S.iata)}</b><small>{html.escape(S.city)}</small></span>"
+                      f"<span class='leg'><span class='al'>{html.escape(p['airline1'].iata)}</span><span class='line'></span>{p['leg1']:,.0f} mi</span>"
+                      f"<span class='stop mid'><b>{html.escape(via.iata)}</b><small>{html.escape(via.city)}</small></span>"
+                      f"<span class='leg'><span class='al'>{html.escape(p['airline2'].iata)}</span><span class='line'></span>{p['leg2']:,.0f} mi</span>"
+                      f"<span class='stop'><b>{html.escape(D.iata)}</b><small>{html.escape(D.city)}</small></span>"
+                      f"</div></button>")
+        body += f"<div class='trips'>{cards}</div>"
+        body += ("<p class='hint'>The cards above are the <b>shortest</b> trips. The globe and the table below show the "
+                 "<b>top 5 connecting cities by number of route pairs</b> (the busiest places to change planes), "
+                 "which are not always on the shortest path.</p>")
         body += Page.globe(f"<b>Top {len(top5)}</b> intermediate cities between "
                            f"{html.escape(S.iata)} and {html.escape(D.iata)}",
-                           "Click any row to show that connection on the globe (click again to go back to the top 5).")
+                           "Click a trip card or any row to show that connection on the globe (click again to go back to the top 5).")
 
         body += ("<h3>Top 5 intermediate cities (by # route pairs)</h3>"
                  + Page.table(["Rank", "Via", "Airport", "City", "Country", "# Route pairs", "Shortest total (mi)"],
@@ -1166,39 +1843,98 @@ class AviationWebApp:
 
     # ---------------------------------------------------------------- Charts
     @staticmethod
-    def bar_chart(title, sub, items, unit=""):
-        """items: [(label, value, tooltip)] - single series, one hue, value label at the bar end."""
-        top = max((v for _, v, _ in items), default=1) or 1
+    def bar_chart(title, sub, items, unit="", highlight=None, empty="No data."):
+        """items: [(label, value, tooltip[, key])] - one series, one hue, value at the bar end.
+        With highlight set, rows whose key differs are dimmed so the chosen one stands out."""
+        top = max((it[1] for it in items), default=1) or 1
         rows = ""
-        for label, value, tip in items:
+        for it in items:
+            label, value, tip = it[:3]
+            dim = " dim" if highlight and (len(it) < 4 or it[3] != highlight) else ""
             pct = 100 * value / top
-            rows += (f"<div class='bar-row'><div class='lbl' title='{html.escape(label)}'>{html.escape(label)}</div>"
+            rows += (f"<div class='bar-row{dim}'><div class='lbl' title='{html.escape(label)}'>{html.escape(label)}</div>"
                      f"<div class='bar-track'><div class='tip'>{html.escape(tip)}</div>"
                      f"<div class='bar' style='width:calc({pct:.2f}% - 60px * {pct / 100:.3f})'></div>"
                      f"<span class='bar-val' style='left:calc({pct:.2f}% - 60px * {pct / 100:.3f})'>{value:,}{unit}</span>"
                      f"</div></div>")
-        return f"<div class='chart'><h3>{html.escape(title)}</h3><p class='sub'>{html.escape(sub)}</p>{rows}</div>"
+        if not items:
+            rows = f"<p class='count'>{html.escape(empty)}</p>"
+        return f"<div class='chart'><h3>{html.escape(title)}</h3><p class='csub'>{html.escape(sub)}</p>{rows}</div>"
 
-    def charts(self, _):
-        s = self.db.stats()
+    @staticmethod
+    def stacked_chart(title, sub, items, highlight=None):
+        """items: [(label, domestic, international, key)] - two-part bars with a legend and both numbers."""
+        top = max((d + i for _, d, i, _ in items), default=1) or 1
+        rows = ""
+        for label, d, i, key in items:
+            dim = " dim" if highlight and key != highlight else ""
+            wd, wi = 100 * d / top, 100 * i / top
+            share = 100 * i / (d + i) if d + i else 0
+            rows += (f"<div class='bar-row{dim}'><div class='lbl' title='{html.escape(label)}'>{html.escape(label)}</div>"
+                     f"<div class='bar-track stack'><div class='tip'>{html.escape(label)}: {d:,} domestic, {i:,} international "
+                     f"({share:.0f}% international)</div>"
+                     f"<span class='seg dom' style='width:calc({wd:.2f}% - 96px * {wd / 100:.3f})'></span>"
+                     f"<span class='seg intl' style='width:calc({wi:.2f}% - 96px * {wi / 100:.3f})'></span>"
+                     f"<span class='seg-val'>{d:,} · {i:,}</span></div></div>")
+        legend = ("<div class='legend'><span><i class='sw dom'></i>Domestic (same country)</span>"
+                  "<span><i class='sw intl'></i>International</span></div>")
+        return (f"<div class='chart'><h3>{html.escape(title)}</h3><p class='csub'>{html.escape(sub)}</p>"
+                f"{legend}{rows}</div>")
+
+    @staticmethod
+    def column_chart(title, sub, items):
+        """items: [(label, value, tooltip)] - vertical columns for an ordered distribution."""
+        top = max((v for _, v, _ in items), default=1) or 1
+        cols = "".join(
+            f"<div class='col'><span class='cval'>{v:,}</span>"
+            f"<span class='cbar' style='height:{max(100 * v / top, 0.8):.1f}%' title='{html.escape(tip)}'></span>"
+            f"<span class='clbl'>{html.escape(lbl)}</span></div>" for lbl, v, tip in items)
+        cols += ""
+        return (f"<div class='chart'><h3>{html.escape(title)}</h3><p class='csub'>{html.escape(sub)}</p>"
+                f"<div class='cols'>{cols}</div></div>")
+
+    def charts(self, query):
+        code = query.get("airline", [""])[0].strip().upper()
+        al = self.db.get_airline(code) if code else None
+        s = self.db.stats(al)
+        key = al.iata if al else None
         lg = s["longest"]
-        tiles = [(f"{len(self.db.airlines_by_iata)}", "Airlines"),
-                 (f"{len(self.db.airports_by_iata)}", "Airports"),
-                 (f"{len(self.db.routes):,}", "Routes (one direction each)"),
+        short = lambda n: n.replace(" Air Lines", "").replace(" Airlines", "").replace(" Airways", "").strip() or n
+        btns = [("All airlines", "/charts", not al)] + [
+            (f"{a.iata} {short(a.name)}", f"/charts?airline={a.iata}", al is a) for a in self.db.all_airlines()]
+        bar = ("<div class='chips filter-row'><span class='lbl'>Show:</span>"
+               + "".join(f"<a class='fchip{' on' if on else ''}' href='{u}'>{html.escape(t)}</a>" for t, u, on in btns)
+               + "</div>")
+        who_plain = al.name if al else "All airlines"
+        who = html.escape(who_plain)
+        tiles = [(f"{s['n_routes']:,}", "Routes (one direction each)"),
+                 (f"{s['n_airports']:,}", "Airports served"),
                  (f"{s['n_countries']}", "Countries served"),
                  (f"{s['avg_miles']:,.0f} mi", "Average route length"),
                  (f"{lg[2]:,.0f} mi" if lg else "-", f"Longest: {lg[0].iata} → {lg[1].iata}" if lg else "Longest route")]
-        body = ("<h2>Charts</h2><div class='tiles'>"
+        if not al:
+            tiles.insert(0, (f"{len(self.db.airlines_by_iata)}", "Airlines"))
+        body = (f"<h2>Charts</h2>{bar}<h3 class='who'>{who}</h3><div class='tiles'>"
                 + "".join(f"<div class='tile'><div class='v'>{html.escape(v)}</div><div class='l'>{html.escape(l)}</div></div>"
-                          for v, l in tiles) + "</div><div class='grid2'>")
+                          for v, l in tiles) + "</div><div class='grid2 cgrid'>")
         body += self.bar_chart("Routes per airline", "Number of routes each airline flies",
-                               [(f"{a.iata} {a.name}", n, f"{a.name}: {n:,} routes") for a, n in s["routes_per_airline"]])
-        body += self.bar_chart("Busiest airports", "Top 15 by routes to or from the airport, all airlines",
+                               [(f"{a.iata} {short(a.name)}", n, f"{a.name}: {n:,} routes", a.iata)
+                                for a, n in s["routes_per_airline"]], highlight=key)
+        body += self.stacked_chart("Domestic vs international", "Routes inside one country compared with routes "
+                                   "between countries",
+                                   [(f"{a.iata} {short(a.name)}", d, i, a.iata) for a, d, i in s["domestic_split"]],
+                                   highlight=key)
+        body += self.bar_chart("Busiest airports", f"Top 15 by routes to or from the airport · {who_plain}",
                                [(f"{a.iata} {a.city}", n, f"{a.name}: {n:,} routes") for a, n in s["busiest_airports"]])
-        body += self.bar_chart("Airports by country", "Top 10 countries by number of airports",
-                               [(c, n, f"{c}: {n} airports") for c, n in s["countries"]])
-        body += self.bar_chart("Route lengths", "Distinct airport-to-airport connections in each distance band (air miles)",
-                               [(f"{lbl} mi", n, f"{n:,} routes of {lbl} miles") for lbl, n in s["length_buckets"]])
+        body += self.column_chart("Route lengths", f"Airport-to-airport connections by distance in air miles (k = 1,000) · {who_plain}",
+                                  [(f"{lbl}", n, f"{n:,} connections, {lbl} miles") for lbl, n in s["length_buckets"]])
+        body += self.bar_chart("Longest routes", f"Top 10 by air miles (both directions counted once) · {who_plain}",
+                               [(f"{a.iata} ⇄ {b.iata}  {', '.join(sorted(als))}", round(mi),
+                                 f"{a.city} ⇄ {b.city} · {', '.join(sorted(als))} · {mi:,.0f} mi")
+                                for a, b, mi, als in s["longest_routes"]], unit=" mi")
+        body += self.bar_chart("Top countries outside the US", f"Routes arriving in each foreign country · {who_plain}",
+                               [(c, n, f"{c}: {n:,} routes") for c, n in s["foreign_countries"]],
+                               empty="This airline has no international routes.")
         body += "</div>"
         return self.render("Charts", body)
 
@@ -1369,6 +2105,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             return self.send_image(find_photo())
         if path == "/hero":
             return self.send_image(find_hero())
+        if path == "/api/lookup.json":
+            data = json.dumps(self.app_for_request().db.lookup_data()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         status, page = self.app_for_request().handle(path, parse_qs(url.query))
         data = page.encode("utf-8")
         self.send_response(status)
